@@ -17,6 +17,9 @@ TELEGRAM_TOKEN = os.environ["TELEGRAM_TOKEN"]
 GROQ_API_KEY = os.environ["GROQ_API_KEY"]
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
 OPENWEATHER_API_KEY = os.environ.get("OPENWEATHER_API_KEY", "")
+ELEVENLABS_API_KEY = os.environ.get("ELEVENLABS_API_KEY", "")
+ELEVENLABS_VOICE_ID = "nPczCjzI2devNBz1zQrb"  # Brian - grave e confortante
+ELEVENLABS_MODEL = "eleven_multilingual_v2"
 
 BR_TIMEZONE = pytz.timezone("America/Sao_Paulo")
 DATA_CRIACAO = "01 de maio de 2025"
@@ -136,9 +139,35 @@ async def descrever_imagem_groq(image_bytes: bytes) -> str:
             result = await resp.json()
             return result["choices"][0]["message"]["content"]
 
-# ─── TTS ─────────────────────────────────────────────────────────────────────
+# ─── TTS (ElevenLabs) ─────────────────────────────────────────────────────────
 
 async def texto_para_audio(texto: str):
+    # Tenta ElevenLabs primeiro
+    if ELEVENLABS_API_KEY:
+        try:
+            texto_limitado = texto[:500]
+            url = f"https://api.elevenlabs.io/v1/text-to-speech/{ELEVENLABS_VOICE_ID}"
+            headers = {
+                "xi-api-key": ELEVENLABS_API_KEY,
+                "Content-Type": "application/json",
+                "Accept": "audio/mpeg"
+            }
+            payload = {
+                "text": texto_limitado,
+                "model_id": ELEVENLABS_MODEL,
+                "voice_settings": {
+                    "stability": 0.5,
+                    "similarity_boost": 0.75
+                }
+            }
+            async with aiohttp.ClientSession() as session:
+                async with session.post(url, headers=headers, json=payload, timeout=aiohttp.ClientTimeout(total=30)) as resp:
+                    if resp.status == 200:
+                        return await resp.read()
+                    logger.error(f"ElevenLabs status {resp.status}: {await resp.text()}")
+        except Exception as e:
+            logger.error(f"Erro ElevenLabs TTS: {e}")
+    # Fallback: Google TTS
     try:
         texto_curto = texto[:200]
         url = f"https://translate.google.com/translate_tts?ie=UTF-8&q={quote(texto_curto)}&tl=pt-BR&client=tw-ob"
@@ -148,7 +177,7 @@ async def texto_para_audio(texto: str):
                 if resp.status == 200:
                     return await resp.read()
     except Exception as e:
-        logger.error(f"Erro TTS: {e}")
+        logger.error(f"Erro TTS fallback: {e}")
     return None
 
 # ─── IMAGEM ──────────────────────────────────────────────────────────────────
@@ -284,12 +313,22 @@ async def processar_audio_resposta(update: Update, context, pergunta: str):
 
 async def processar_imagem(update: Update, prompt: str):
     msg = update.message if update.message else update.callback_query.message
-    await msg.reply_text(f"Gerando: {prompt}... aguenta aí!")
+    aviso = await msg.reply_text(f"Gerando: {prompt}... aguenta aí!")
     try:
         img_bytes = await gerar_imagem(prompt)
-        await msg.reply_photo(photo=img_bytes, caption=f"🎨 {prompt}")
+        # Deleta o "aguenta aí" e manda a imagem primeiro, depois a confirmação
+        try:
+            await aviso.delete()
+        except Exception:
+            pass
+        await msg.reply_photo(photo=img_bytes)
+        await msg.reply_text(f"Pronto, já gerei a sua imagem! 🎨")
     except Exception as e:
         logger.error(f"Erro imagem: {e}")
+        try:
+            await aviso.delete()
+        except Exception:
+            pass
         await msg.reply_text("Deu ruim na geração. Tenta de novo!")
 
 async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -393,3 +432,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
