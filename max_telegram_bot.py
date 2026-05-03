@@ -16,7 +16,6 @@ logger = logging.getLogger(__name__)
 TELEGRAM_TOKEN = os.environ["TELEGRAM_TOKEN"]
 GROQ_API_KEY = os.environ["GROQ_API_KEY"]
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
-OPENWEATHER_API_KEY = os.environ.get("OPENWEATHER_API_KEY", "")
 ELEVENLABS_API_KEY = os.environ.get("ELEVENLABS_API_KEY", "")
 ELEVENLABS_VOICE_ID = "nPczCjzI2devNBz1zQrb"  # Brian - grave e confortante
 ELEVENLABS_MODEL = "eleven_multilingual_v2"
@@ -59,21 +58,14 @@ def get_datetime_info():
         "dia_semana": dias[now.weekday()]
     }
 
-async def get_previsao_tempo(cidade="Salto,BR"):
-    if not OPENWEATHER_API_KEY:
-        return "Previsão indisponível (sem chave API configurada)"
-    url = f"https://api.openweathermap.org/data/2.5/weather?q={cidade}&appid={OPENWEATHER_API_KEY}&units=metric&lang=pt_br"
+async def get_previsao_tempo(cidade="Salto"):
     try:
+        from urllib.parse import quote as uquote
+        url = f"https://wttr.in/{uquote(cidade)}?format=3&lang=pt"
         async with aiohttp.ClientSession() as session:
             async with session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as resp:
-                data = await resp.json()
-                if data.get("cod") == 200:
-                    desc = data["weather"][0]["description"]
-                    temp = data["main"]["temp"]
-                    sensacao = data["main"]["feels_like"]
-                    umidade = data["main"]["humidity"]
-                    return f"{desc.capitalize()}, {temp:.0f}°C (sensação {sensacao:.0f}°C), umidade {umidade}%"
-                return "Não consegui buscar a previsão agora."
+                text = await resp.text()
+                return text.strip()
     except Exception as e:
         logger.error(f"Erro tempo: {e}")
         return "Erro ao buscar previsão do tempo."
