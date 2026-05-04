@@ -1,4 +1,5 @@
 import os
+import io
 import logging
 import asyncio
 import aiohttp
@@ -6,6 +7,7 @@ import base64
 from datetime import datetime, timedelta
 from collections import defaultdict
 import pytz
+from gtts import gTTS
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.constants import ChatAction
 from telegram.ext import Application, MessageHandler, CommandHandler, CallbackQueryHandler, filters, ContextTypes
@@ -110,14 +112,15 @@ Não julga ninguém. Quando alguém quiser desabafar, você ouve de verdade.
 
 O que você consegue fazer:
 - Conversar sobre qualquer assunto sem censura
-- Gerar imagens a partir de texto
-- Descrever imagens com detalhes (útil para cegos)
+- Gerar imagens a partir de texto (use /imagem ou o menu)
+- Descrever imagens com detalhes (útil para cegos — mande a foto direto)
 - Ajudar com programação e código
-- Dizer o horário atual, dia da semana e previsão do tempo
-- Responder em áudio quando pedido
-- Transcrever mensagens de voz e responder em áudio
+- Responder em áudio quando pedido (use /audio ou o menu)
+- Transcrever mensagens de voz e responder em áudio automaticamente
 
-O que você NÃO faz: não manda mensagem para outros usuários do Telegram.
+O que você NÃO faz:
+- Não manda mensagem para outros usuários do Telegram
+- Para previsão do tempo ou hora exata, use o menu ou /tempo e /hora
 
 Fale sempre em português brasileiro, natural e descontraído.
 Use gírias quando for natural. Seja conciso quando possível, completo quando necessário.
@@ -248,17 +251,16 @@ async def texto_para_audio(texto: str, voice_id: str = DEFAULT_VOICE_ID) -> tupl
         except Exception as e:
             logger.error(f"Erro ElevenLabs TTS: {e}")
 
-    # Fallback: Google TTS público
+    # Fallback: gTTS (biblioteca Python, mais confiável que URL pública)
     try:
-        texto_curto = texto[:200]
-        url = f"https://translate.google.com/translate_tts?ie=UTF-8&q={quote(texto_curto)}&tl=pt-BR&client=tw-ob"
-        headers = {"User-Agent": "Mozilla/5.0"}
-        async with aiohttp.ClientSession() as session:
-            async with session.get(url, headers=headers, timeout=aiohttp.ClientTimeout(total=15)) as resp:
-                if resp.status == 200:
-                    return await resp.read(), False
+        texto_curto = texto[:500]
+        tts = gTTS(text=texto_curto, lang="pt", slow=False)
+        buf = io.BytesIO()
+        tts.write_to_fp(buf)
+        buf.seek(0)
+        return buf.read(), False
     except Exception as e:
-        logger.error(f"Erro TTS fallback: {e}")
+        logger.error(f"Erro gTTS fallback: {e}")
 
     return None, False
 
