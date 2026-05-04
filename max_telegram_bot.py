@@ -14,8 +14,7 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 TELEGRAM_TOKEN = os.environ["TELEGRAM_TOKEN"]
-GROQ_API_KEY = os.environ["GROQ_API_KEY"]
-GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
+GEMINI_API_KEY = os.environ["GEMINI_API_KEY"]
 ELEVENLABS_API_KEY = os.environ.get("ELEVENLABS_API_KEY", "")
 ELEVENLABS_MODEL = "eleven_multilingual_v2"
 
@@ -51,7 +50,6 @@ VOZES_ELEVENLABS = [
 VOZES_POR_PAGINA = 5
 DEFAULT_VOICE_ID = "nPczCjzI2devNBz1zQrb"  # Brian
 
-# user_id -> voice_id
 user_voice = {}
 
 def get_voice_id(user_id: int) -> str:
@@ -104,66 +102,77 @@ async def get_previsao_tempo(cidade="Salto"):
         logger.error(f"Erro tempo: {e}")
         return "Erro ao buscar previsão do tempo."
 
-# ─── GROQ ────────────────────────────────────────────────────────────────────
-
-async def perguntar_groq(mensagens: list) -> str:
-    dt = get_datetime_info()
-    sys = SYSTEM_PROMPT + f"\n\nAgora são {dt['hora']} de {dt['dia_semana']}, {dt['data']} (horário de Brasília)."
-    url = "https://api.groq.com/openai/v1/chat/completions"
-    headers = {"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"}
-    payload = {
-        "model": "llama-3.3-70b-versatile",
-        "messages": [{"role": "system", "content": sys}] + mensagens,
-        "max_tokens": 1024
-    }
-    async with aiohttp.ClientSession() as session:
-        async with session.post(url, headers=headers, json=payload) as resp:
-            result = await resp.json()
-            return result["choices"][0]["message"]["content"]
+# ─── GEMINI ──────────────────────────────────────────────────────────────────
 
 async def perguntar_gemini(mensagens: list) -> str:
-    if not GEMINI_API_KEY:
-        return await perguntar_groq(mensagens)
     dt = get_datetime_info()
-    sys = SYSTEM_PROMPT + f"\n\nAgora são {dt['hora']} de {dt['dia_semana']}, {dt['data']} (horário de Brasília)."
+    sys_text = SYSTEM_PROMPT + f"\n\nAgora são {dt['hora']} de {dt['dia_semana']}, {dt['data']} (horário de Brasília)."
     url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key={GEMINI_API_KEY}"
     contents = []
     for msg in mensagens:
         role = "user" if msg["role"] == "user" else "model"
-        contents.append({"role": role, "parts": [{"text": msg["content"]}]})
+        if isinstance(msg.get("content"), list):
+            parts = msg["content"]
+        else:
+            parts = [{"text": msg["content"]}]
+        contents.append({"role": role, "parts": parts})
     payload = {
-        "system_instruction": {"parts": [{"text": sys}]},
+        "system_instruction": {"parts": [{"text": sys_text}]},
         "contents": contents,
         "generationConfig": {"maxOutputTokens": 1024}
     }
-    try:
-        async with aiohttp.ClientSession() as session:
-            async with session.post(url, json=payload, timeout=aiohttp.ClientTimeout(total=30)) as resp:
-                result = await resp.json()
+    async with aiohttp.ClientSession() as session:
+        async with session.post(url, json=payload, timeout=aiohttp.ClientTimeout(total=30)) as resp:
+            result = await resp.json()
+            if "candidates" in result:
                 return result["candidates"][0]["content"]["parts"][0]["text"]
-    except Exception as e:
-        logger.error(f"Erro Gemini: {e}, usando Groq")
-        return await perguntar_groq(mensagens)
+            else:
+                logger.error(f"Gemini erro: {result}")
+                return "Eita, deu um erro aqui. Tenta de novo!"
 
-async def descrever_imagem_groq(image_bytes: bytes) -> str:
+async def descrever_imagem_gemini(image_bytes: bytes) -> str:
     b64 = base64.b64encode(image_bytes).decode()
-    url = "https://api.groq.com/openai/v1/chat/completions"
-    headers = {"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"}
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key={GEMINI_API_KEY}"
     payload = {
-        "model": "meta-llama/llama-4-scout-17b-16e-instruct",
-        "messages": [{
+        "contents": [{
             "role": "user",
-            "content": [
-                {"type": "text", "text": "Descreva essa imagem detalhadamente para uma pessoa cega. Seja preciso sobre cores, formas, pessoas, expressões, texto visível e contexto geral."},
-                {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64}"}}
+            "parts": [
+                {"text": "Descreva essa imagem detalhadamente para uma pessoa cega. Seja preciso sobre cores, formas, pessoas, expressões, texto visível e contexto geral."},
+                {"inline_data": {"mime_type": "image/jpeg", "data": b64}}
             ]
         }],
-        "max_tokens": 1024
+        "generationConfig": {"maxOutputTokens": 1024}
     }
     async with aiohttp.ClientSession() as session:
-        async with session.post(url, headers=headers, json=payload) as resp:
+        async with session.post(url, json=payload, timeout=aiohttp.ClientTimeout(total=30)) as resp:
             result = await resp.json()
-            return result["choices"][0]["message"]["content"]
+            if "candidates" in result:
+                return result["candidates"][0]["content"]["parts"][0]["text"]
+            else:
+                logger.error(f"Gemini visão erro: {result}")
+                return "Não consegui descrever a imagem agora."
+
+async def transcrever_audio_gemini(audio_bytes: bytes, mime_type: str = "audio/ogg") -> str:
+    b64 = base64.b64encode(audio_bytes).decode()
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key={GEMINI_API_KEY}"
+    payload = {
+        "contents": [{
+            "role": "user",
+            "parts": [
+                {"text": "Transcreva exatamente o que está sendo dito neste áudio em português. Retorne apenas a transcrição, sem comentários adicionais."},
+                {"inline_data": {"mime_type": mime_type, "data": b64}}
+            ]
+        }],
+        "generationConfig": {"maxOutputTokens": 512}
+    }
+    async with aiohttp.ClientSession() as session:
+        async with session.post(url, json=payload, timeout=aiohttp.ClientTimeout(total=30)) as resp:
+            result = await resp.json()
+            if "candidates" in result:
+                return result["candidates"][0]["content"]["parts"][0]["text"].strip()
+            else:
+                logger.error(f"Gemini áudio erro: {result}")
+                return None
 
 # ─── TTS (ElevenLabs) ─────────────────────────────────────────────────────────
 
@@ -180,10 +189,7 @@ async def texto_para_audio(texto: str, voice_id: str = DEFAULT_VOICE_ID):
             payload = {
                 "text": texto_limitado,
                 "model_id": ELEVENLABS_MODEL,
-                "voice_settings": {
-                    "stability": 0.5,
-                    "similarity_boost": 0.75
-                }
+                "voice_settings": {"stability": 0.5, "similarity_boost": 0.75}
             }
             async with aiohttp.ClientSession() as session:
                 async with session.post(url, headers=headers, json=payload, timeout=aiohttp.ClientTimeout(total=30)) as resp:
@@ -192,7 +198,6 @@ async def texto_para_audio(texto: str, voice_id: str = DEFAULT_VOICE_ID):
                     logger.error(f"ElevenLabs status {resp.status}: {await resp.text()}")
         except Exception as e:
             logger.error(f"Erro ElevenLabs TTS: {e}")
-    # Fallback: Google TTS
     try:
         texto_curto = texto[:200]
         url = f"https://translate.google.com/translate_tts?ie=UTF-8&q={quote(texto_curto)}&tl=pt-BR&client=tw-ob"
@@ -205,8 +210,7 @@ async def texto_para_audio(texto: str, voice_id: str = DEFAULT_VOICE_ID):
         logger.error(f"Erro TTS fallback: {e}")
     return None
 
-async def preview_voz(voice_id: str) -> bytes | None:
-    """Gera um preview curto da voz."""
+async def preview_voz(voice_id: str):
     if not ELEVENLABS_API_KEY:
         return None
     texto = "Olá! Eu sou o Max. Essa é uma amostra da minha voz."
@@ -241,29 +245,22 @@ def menu_principal():
             InlineKeyboardButton("🔊 Resposta em Áudio", callback_data="menu_audio"),
             InlineKeyboardButton("🎙️ Escolher Voz", callback_data="vozes_pg_0"),
         ],
-        [
-            InlineKeyboardButton("❓ Ajuda", callback_data="menu_ajuda"),
-        ]
+        [InlineKeyboardButton("❓ Ajuda", callback_data="menu_ajuda")]
     ]
     return InlineKeyboardMarkup(keyboard)
 
 def menu_vozes(pagina: int, user_id: int):
-    """Monta o teclado da página de vozes."""
     inicio = pagina * VOZES_POR_PAGINA
     fim = inicio + VOZES_POR_PAGINA
     vozes_pagina = VOZES_ELEVENLABS[inicio:fim]
     voz_atual = get_voice_id(user_id)
-
     keyboard = []
     for v in vozes_pagina:
         marca = " ✅" if v["id"] == voz_atual else ""
-        keyboard.append([
-            InlineKeyboardButton(
-                f"🎙️ {v['nome']} — {v['desc']}{marca}",
-                callback_data=f"voz_info_{v['id']}"
-            )
-        ])
-
+        keyboard.append([InlineKeyboardButton(
+            f"🎙️ {v['nome']} — {v['desc']}{marca}",
+            callback_data=f"voz_info_{v['id']}"
+        )])
     nav = []
     total_pags = (len(VOZES_ELEVENLABS) + VOZES_POR_PAGINA - 1) // VOZES_POR_PAGINA
     if pagina > 0:
@@ -272,12 +269,10 @@ def menu_vozes(pagina: int, user_id: int):
         nav.append(InlineKeyboardButton("Próxima ▶", callback_data=f"vozes_pg_{pagina + 1}"))
     if nav:
         keyboard.append(nav)
-
     keyboard.append([InlineKeyboardButton("🏠 Menu Principal", callback_data="menu_principal")])
     return InlineKeyboardMarkup(keyboard)
 
 def menu_voz_detalhe(voice_id: str, pagina: int):
-    """Botões de detalhe de uma voz."""
     keyboard = [
         [
             InlineKeyboardButton("▶️ Ouvir Amostra", callback_data=f"voz_preview_{voice_id}_{pagina}"),
@@ -407,7 +402,7 @@ async def processar_imagem(update: Update, prompt: str):
         except Exception:
             pass
         await msg.reply_photo(photo=img_bytes)
-        await msg.reply_text(f"Pronto, já gerei a sua imagem! 🎨")
+        await msg.reply_text("Pronto, já gerei a sua imagem! 🎨")
     except Exception as e:
         logger.error(f"Erro imagem: {e}")
         try:
@@ -422,12 +417,10 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     data = query.data
     user_id = query.from_user.id
 
-    # ── Menu principal ──
     if data == "menu_principal":
         await query.message.reply_text("O que você quer fazer?", reply_markup=menu_principal())
         return
 
-    # ── Navegação de vozes: vozes_pg_N ──
     if data.startswith("vozes_pg_"):
         pagina = int(data.split("_")[2])
         voz_atual = get_voice_id(user_id)
@@ -438,14 +431,12 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    # ── Detalhe de voz: voz_info_<id> ──
     if data.startswith("voz_info_"):
         voice_id = data[len("voz_info_"):]
         voz = next((v for v in VOZES_ELEVENLABS if v["id"] == voice_id), None)
         if not voz:
             await query.message.reply_text("Voz não encontrada.")
             return
-        # descobrir em qual página está essa voz
         idx = next((i for i, v in enumerate(VOZES_ELEVENLABS) if v["id"] == voice_id), 0)
         pagina = idx // VOZES_POR_PAGINA
         voz_atual = get_voice_id(user_id)
@@ -456,12 +447,8 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    # ── Preview de voz: voz_preview_<id>_<pagina> ──
     if data.startswith("voz_preview_"):
         parts = data.split("_")
-        # voz_preview_<voice_id>_<pagina>  — voice_id pode ter underscores? Não, são alfanum
-        # formato: voz_preview_{voice_id}_{pagina}
-        # partes: ['voz', 'preview', voice_id, pagina]
         voice_id = parts[2]
         pagina = int(parts[3])
         voz = next((v for v in VOZES_ELEVENLABS if v["id"] == voice_id), None)
@@ -479,7 +466,6 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.message.reply_text("Não consegui gerar o preview agora. Tenta de novo!")
         return
 
-    # ── Usar voz: voz_usar_<id>_<pagina> ──
     if data.startswith("voz_usar_"):
         parts = data.split("_")
         voice_id = parts[2]
@@ -493,7 +479,6 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    # ── Menu original ──
     if data == "menu_imagem":
         user_waiting[user_id] = "imagem"
         await query.message.reply_text("Descreve a imagem que você quer e eu gero!")
@@ -559,77 +544,41 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         async with session.get(file.file_path) as resp:
             img_bytes = await resp.read()
     try:
-        descricao = await descrever_imagem_groq(img_bytes)
+        descricao = await descrever_imagem_gemini(img_bytes)
         await update.message.reply_text(f"Descrição da imagem:\n\n{descricao}")
     except Exception as e:
         logger.error(f"Erro descrição: {e}")
         await update.message.reply_text("Não consegui descrever essa imagem. Tenta de novo!")
 
-async def transcrever_audio(audio_bytes: bytes, mime_type: str = "audio/ogg") -> str:
-    url = "https://api.groq.com/openai/v1/audio/transcriptions"
-    headers = {"Authorization": f"Bearer {GROQ_API_KEY}"}
-    ext = "ogg"
-    if "mp4" in mime_type or "m4a" in mime_type:
-        ext = "m4a"
-    elif "mpeg" in mime_type or "mp3" in mime_type:
-        ext = "mp3"
-    elif "wav" in mime_type:
-        ext = "wav"
-    form_data = aiohttp.FormData()
-    form_data.add_field("file", audio_bytes, filename=f"audio.{ext}", content_type=mime_type)
-    form_data.add_field("model", "whisper-large-v3")
-    form_data.add_field("language", "pt")
-    form_data.add_field("response_format", "text")
-    async with aiohttp.ClientSession() as session:
-        async with session.post(url, headers=headers, data=form_data) as resp:
-            if resp.status == 200:
-                return (await resp.text()).strip()
-            else:
-                logger.error(f"Erro Whisper: {resp.status} - {await resp.text()}")
-                return None
-
 async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Áudio → transcreve com Whisper → responde em áudio via ElevenLabs"""
     chat_id = update.effective_chat.id
     user_id = update.effective_user.id
-
     await context.bot.send_chat_action(chat_id=chat_id, action=ChatAction.TYPING)
-
     voice = update.message.voice
     voice_file = await context.bot.get_file(voice.file_id)
-
     async with aiohttp.ClientSession() as session:
         async with session.get(voice_file.file_path) as resp:
             audio_bytes = await resp.read()
-
-    transcricao = await transcrever_audio(audio_bytes, mime_type="audio/ogg")
-
+    transcricao = await transcrever_audio_gemini(audio_bytes, mime_type="audio/ogg")
     if not transcricao:
         await update.message.reply_text("Não consegui entender o áudio. Tenta de novo?")
         return
-
     logger.info(f"Transcrição: {transcricao}")
-
     if user_id not in user_history:
         user_history[user_id] = []
-
     user_history[user_id].append({"role": "user", "content": transcricao})
     if len(user_history[user_id]) > 20:
         user_history[user_id] = user_history[user_id][-20:]
-
     try:
-        resposta = await perguntar_ia(user_history[user_id])
+        resposta = await perguntar_gemini(user_history[user_id])
         user_history[user_id].append({"role": "assistant", "content": resposta})
-
         await context.bot.send_chat_action(chat_id=chat_id, action=ChatAction.RECORD_VOICE)
         voice_id = get_voice_id(user_id)
         audio_resposta = await texto_para_audio(resposta, voice_id=voice_id)
-
         if audio_resposta:
             await update.message.reply_voice(voice=audio_resposta)
         else:
             await update.message.reply_text(resposta)
-
     except Exception as e:
         logger.error(f"Erro no handle_voice: {e}")
         await update.message.reply_text("Deu um erro aqui. Tenta de novo!")
@@ -649,7 +598,7 @@ def main():
     app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     app.add_handler(MessageHandler(filters.VOICE, handle_voice))
-    logger.info("Max v3 — Menu de Vozes iniciado!")
+    logger.info("Max v3 — Gemini iniciado!")
     app.run_polling(drop_pending_updates=True)
 
 if __name__ == "__main__":
