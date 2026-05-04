@@ -17,11 +17,45 @@ TELEGRAM_TOKEN = os.environ["TELEGRAM_TOKEN"]
 GROQ_API_KEY = os.environ["GROQ_API_KEY"]
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
 ELEVENLABS_API_KEY = os.environ.get("ELEVENLABS_API_KEY", "")
-ELEVENLABS_VOICE_ID = "nPczCjzI2devNBz1zQrb"  # Brian - grave e confortante
 ELEVENLABS_MODEL = "eleven_multilingual_v2"
 
 BR_TIMEZONE = pytz.timezone("America/Sao_Paulo")
 DATA_CRIACAO = "01 de maio de 2025"
+
+# ─── VOZES ELEVENLABS ────────────────────────────────────────────────────────
+
+VOZES_ELEVENLABS = [
+    {"id": "nPczCjzI2devNBz1zQrb", "nome": "Brian",   "desc": "Profundo, Reconfortante"},
+    {"id": "pNInz6obpgDQGcFmaJgB", "nome": "Adam",    "desc": "Dominante, Firme"},
+    {"id": "IKne3meq5aSn9XLyUdCD", "nome": "Charlie", "desc": "Confiante, Energético"},
+    {"id": "cjVigY5qzO86Huf0OWal", "nome": "Eric",    "desc": "Suave, Confiável"},
+    {"id": "JBFqnCBsd6RMkjVDRZzb", "nome": "George",  "desc": "Narrador, Cativante"},
+    {"id": "onwK4e9ZLuTAKqWW03F9", "nome": "Daniel",  "desc": "Locutor, Formal"},
+    {"id": "pqHfZKP75CvOlQylNhV4", "nome": "Bill",    "desc": "Sábio, Maduro"},
+    {"id": "SOYHLrjzK2X1ezoPC6cr", "nome": "Harry",   "desc": "Guerreiro, Intenso"},
+    {"id": "iP95p4xoKVk53GoZ742B", "nome": "Chris",   "desc": "Charmoso, Casual"},
+    {"id": "TX3LPaxmHKxFdv7VOQHJ", "nome": "Liam",    "desc": "Energético, Creator"},
+    {"id": "bIHbv24MWmeRgasZH58o", "nome": "Will",    "desc": "Relaxado, Otimista"},
+    {"id": "N2lVS1w4EtoT3dr4eOWO", "nome": "Callum",  "desc": "Malicioso, Rouco"},
+    {"id": "CwhRBWXzGAHq8TQ4Fs17", "nome": "Roger",   "desc": "Casual, Ressonante"},
+    {"id": "SAz9YHcvj6GT2YYXdXww", "nome": "River",   "desc": "Relaxado, Neutro"},
+    {"id": "EXAVITQu4vr4xnSDxMaL", "nome": "Sarah",   "desc": "Madura, Confiante"},
+    {"id": "cgSgspJ2msm6clMCkdW9", "nome": "Jessica", "desc": "Brincalhona, Calorosa"},
+    {"id": "Xb7hH8MSUJpSbSDYk0k2", "nome": "Alice",   "desc": "Clara, Educadora"},
+    {"id": "XrExE9yKIg1WjnnlVkGX", "nome": "Matilda", "desc": "Profissional, Animada"},
+    {"id": "FGY2WhTYpPnrIDTdsKH5", "nome": "Laura",   "desc": "Entusiasta, Atitude"},
+    {"id": "hpp4J3VqNfWAUOO0d1Us", "nome": "Bella",   "desc": "Brilhante, Calorosa"},
+    {"id": "pFZP5JQG7iQjIQuC4Bku", "nome": "Lily",    "desc": "Aveludada, Atriz"},
+]
+
+VOZES_POR_PAGINA = 5
+DEFAULT_VOICE_ID = "nPczCjzI2devNBz1zQrb"  # Brian
+
+# user_id -> voice_id
+user_voice = {}
+
+def get_voice_id(user_id: int) -> str:
+    return user_voice.get(user_id, DEFAULT_VOICE_ID)
 
 SYSTEM_PROMPT = f"""Você é o Max, uma IA brasileira sem censura, direta e extremamente capaz.
 Criado em {DATA_CRIACAO} pela Zapia em parceria com o Gustavo.
@@ -133,12 +167,11 @@ async def descrever_imagem_groq(image_bytes: bytes) -> str:
 
 # ─── TTS (ElevenLabs) ─────────────────────────────────────────────────────────
 
-async def texto_para_audio(texto: str):
-    # Tenta ElevenLabs primeiro
+async def texto_para_audio(texto: str, voice_id: str = DEFAULT_VOICE_ID):
     if ELEVENLABS_API_KEY:
         try:
             texto_limitado = texto[:500]
-            url = f"https://api.elevenlabs.io/v1/text-to-speech/{ELEVENLABS_VOICE_ID}"
+            url = f"https://api.elevenlabs.io/v1/text-to-speech/{voice_id}"
             headers = {
                 "xi-api-key": ELEVENLABS_API_KEY,
                 "Content-Type": "application/json",
@@ -172,6 +205,13 @@ async def texto_para_audio(texto: str):
         logger.error(f"Erro TTS fallback: {e}")
     return None
 
+async def preview_voz(voice_id: str) -> bytes | None:
+    """Gera um preview curto da voz."""
+    if not ELEVENLABS_API_KEY:
+        return None
+    texto = "Olá! Eu sou o Max. Essa é uma amostra da minha voz."
+    return await texto_para_audio(texto, voice_id=voice_id)
+
 # ─── IMAGEM ──────────────────────────────────────────────────────────────────
 
 async def gerar_imagem(prompt: str) -> bytes:
@@ -199,8 +239,51 @@ def menu_principal():
         ],
         [
             InlineKeyboardButton("🔊 Resposta em Áudio", callback_data="menu_audio"),
+            InlineKeyboardButton("🎙️ Escolher Voz", callback_data="vozes_pg_0"),
+        ],
+        [
             InlineKeyboardButton("❓ Ajuda", callback_data="menu_ajuda"),
         ]
+    ]
+    return InlineKeyboardMarkup(keyboard)
+
+def menu_vozes(pagina: int, user_id: int):
+    """Monta o teclado da página de vozes."""
+    inicio = pagina * VOZES_POR_PAGINA
+    fim = inicio + VOZES_POR_PAGINA
+    vozes_pagina = VOZES_ELEVENLABS[inicio:fim]
+    voz_atual = get_voice_id(user_id)
+
+    keyboard = []
+    for v in vozes_pagina:
+        marca = " ✅" if v["id"] == voz_atual else ""
+        keyboard.append([
+            InlineKeyboardButton(
+                f"🎙️ {v['nome']} — {v['desc']}{marca}",
+                callback_data=f"voz_info_{v['id']}"
+            )
+        ])
+
+    nav = []
+    total_pags = (len(VOZES_ELEVENLABS) + VOZES_POR_PAGINA - 1) // VOZES_POR_PAGINA
+    if pagina > 0:
+        nav.append(InlineKeyboardButton("◀ Anterior", callback_data=f"vozes_pg_{pagina - 1}"))
+    if pagina < total_pags - 1:
+        nav.append(InlineKeyboardButton("Próxima ▶", callback_data=f"vozes_pg_{pagina + 1}"))
+    if nav:
+        keyboard.append(nav)
+
+    keyboard.append([InlineKeyboardButton("🏠 Menu Principal", callback_data="menu_principal")])
+    return InlineKeyboardMarkup(keyboard)
+
+def menu_voz_detalhe(voice_id: str, pagina: int):
+    """Botões de detalhe de uma voz."""
+    keyboard = [
+        [
+            InlineKeyboardButton("▶️ Ouvir Amostra", callback_data=f"voz_preview_{voice_id}_{pagina}"),
+            InlineKeyboardButton("✅ Usar Esta Voz", callback_data=f"voz_usar_{voice_id}_{pagina}"),
+        ],
+        [InlineKeyboardButton("◀ Voltar às Vozes", callback_data=f"vozes_pg_{pagina}")]
     ]
     return InlineKeyboardMarkup(keyboard)
 
@@ -229,6 +312,15 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def cmd_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("O que você quer fazer?", reply_markup=menu_principal())
 
+async def cmd_vozes(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    voz_atual = get_voice_id(user_id)
+    nome_atual = next((v["nome"] for v in VOZES_ELEVENLABS if v["id"] == voz_atual), "Brian")
+    await update.message.reply_text(
+        f"Voz atual: {nome_atual}\n\nEscolha uma voz do ElevenLabs:",
+        reply_markup=menu_vozes(0, user_id)
+    )
+
 async def cmd_ajuda(update: Update, context: ContextTypes.DEFAULT_TYPE):
     dt = get_datetime_info()
     texto = (
@@ -239,10 +331,11 @@ async def cmd_ajuda(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "• Descrevo imagens com detalhes (para cegos)\n"
         "• Ajudo com programação\n"
         "• Digo hora, data e previsão do tempo\n"
-        "• Respondo em áudio\n\n"
+        "• Respondo em áudio (você escolhe a voz!)\n\n"
         "Comandos:\n"
         "/start → apresentação\n"
         "/menu → menu principal\n"
+        "/vozes → escolher voz do áudio\n"
         "/hora → hora e data atual\n"
         "/tempo [cidade] → previsão do tempo\n"
         "/audio [mensagem] → resposta em áudio\n"
@@ -292,7 +385,8 @@ async def processar_audio_resposta(update: Update, context, pergunta: str):
     try:
         resposta_texto = await perguntar_gemini(user_history[user_id])
         user_history[user_id].append({"role": "assistant", "content": resposta_texto})
-        audio_bytes = await texto_para_audio(resposta_texto)
+        voice_id = get_voice_id(user_id)
+        audio_bytes = await texto_para_audio(resposta_texto, voice_id=voice_id)
         if audio_bytes:
             await update.message.reply_voice(voice=audio_bytes)
             if len(resposta_texto) > 200:
@@ -308,7 +402,6 @@ async def processar_imagem(update: Update, prompt: str):
     aviso = await msg.reply_text(f"Gerando: {prompt}... aguenta aí!")
     try:
         img_bytes = await gerar_imagem(prompt)
-        # Deleta o "aguenta aí" e manda a imagem primeiro, depois a confirmação
         try:
             await aviso.delete()
         except Exception:
@@ -329,6 +422,78 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     data = query.data
     user_id = query.from_user.id
 
+    # ── Menu principal ──
+    if data == "menu_principal":
+        await query.message.reply_text("O que você quer fazer?", reply_markup=menu_principal())
+        return
+
+    # ── Navegação de vozes: vozes_pg_N ──
+    if data.startswith("vozes_pg_"):
+        pagina = int(data.split("_")[2])
+        voz_atual = get_voice_id(user_id)
+        nome_atual = next((v["nome"] for v in VOZES_ELEVENLABS if v["id"] == voz_atual), "Brian")
+        await query.message.reply_text(
+            f"Voz atual: {nome_atual}\n\nEscolha uma voz do ElevenLabs:",
+            reply_markup=menu_vozes(pagina, user_id)
+        )
+        return
+
+    # ── Detalhe de voz: voz_info_<id> ──
+    if data.startswith("voz_info_"):
+        voice_id = data[len("voz_info_"):]
+        voz = next((v for v in VOZES_ELEVENLABS if v["id"] == voice_id), None)
+        if not voz:
+            await query.message.reply_text("Voz não encontrada.")
+            return
+        # descobrir em qual página está essa voz
+        idx = next((i for i, v in enumerate(VOZES_ELEVENLABS) if v["id"] == voice_id), 0)
+        pagina = idx // VOZES_POR_PAGINA
+        voz_atual = get_voice_id(user_id)
+        em_uso = " (em uso)" if voice_id == voz_atual else ""
+        await query.message.reply_text(
+            f"🎙️ {voz['nome']}{em_uso}\n{voz['desc']}\n\nO que você quer fazer?",
+            reply_markup=menu_voz_detalhe(voice_id, pagina)
+        )
+        return
+
+    # ── Preview de voz: voz_preview_<id>_<pagina> ──
+    if data.startswith("voz_preview_"):
+        parts = data.split("_")
+        # voz_preview_<voice_id>_<pagina>  — voice_id pode ter underscores? Não, são alfanum
+        # formato: voz_preview_{voice_id}_{pagina}
+        # partes: ['voz', 'preview', voice_id, pagina]
+        voice_id = parts[2]
+        pagina = int(parts[3])
+        voz = next((v for v in VOZES_ELEVENLABS if v["id"] == voice_id), None)
+        nome = voz["nome"] if voz else voice_id
+        aviso = await query.message.reply_text(f"Gerando amostra de {nome}... aguenta aí!")
+        await context.bot.send_chat_action(chat_id=query.message.chat_id, action=ChatAction.RECORD_VOICE)
+        audio = await preview_voz(voice_id)
+        try:
+            await aviso.delete()
+        except Exception:
+            pass
+        if audio:
+            await query.message.reply_voice(voice=audio)
+        else:
+            await query.message.reply_text("Não consegui gerar o preview agora. Tenta de novo!")
+        return
+
+    # ── Usar voz: voz_usar_<id>_<pagina> ──
+    if data.startswith("voz_usar_"):
+        parts = data.split("_")
+        voice_id = parts[2]
+        pagina = int(parts[3])
+        voz = next((v for v in VOZES_ELEVENLABS if v["id"] == voice_id), None)
+        nome = voz["nome"] if voz else voice_id
+        user_voice[user_id] = voice_id
+        await query.message.reply_text(
+            f"Voz {nome} selecionada! Agora todos os seus áudios vão usar essa voz.",
+            reply_markup=menu_vozes(pagina, user_id)
+        )
+        return
+
+    # ── Menu original ──
     if data == "menu_imagem":
         user_waiting[user_id] = "imagem"
         await query.message.reply_text("Descreve a imagem que você quer e eu gero!")
@@ -356,7 +521,8 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.message.reply_text(
             f"Sou o Max — criado em {DATA_CRIACAO}!\n\n"
             "• Conversa sem filtro\n• Gera imagens\n• Descreve fotos\n"
-            "• Programa contigo\n• Hora e previsão do tempo\n• Resposta em áudio\n\n"
+            "• Programa contigo\n• Hora e previsão do tempo\n• Resposta em áudio\n"
+            "• Escolher voz do ElevenLabs\n\n"
             f"Agora são {dt['hora']} de {dt['dia_semana']}.\n\nUse /menu para voltar!"
         )
 
@@ -409,6 +575,7 @@ def main():
     app = Application.builder().token(TELEGRAM_TOKEN).build()
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("menu", cmd_menu))
+    app.add_handler(CommandHandler("vozes", cmd_vozes))
     app.add_handler(CommandHandler("ajuda", cmd_ajuda))
     app.add_handler(CommandHandler("hora", cmd_hora))
     app.add_handler(CommandHandler("tempo", cmd_tempo))
@@ -419,9 +586,8 @@ def main():
     app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     app.add_handler(MessageHandler(filters.VOICE, handle_voice))
-    logger.info("Max v2 iniciado!")
+    logger.info("Max v3 — Menu de Vozes iniciado!")
     app.run_polling(drop_pending_updates=True)
 
 if __name__ == "__main__":
     main()
-
