@@ -2,6 +2,7 @@ import os
 import io
 import logging
 import asyncio
+import subprocess
 import aiohttp
 import base64
 from datetime import datetime, timedelta
@@ -236,20 +237,49 @@ async def transcrever_audio_gemini(audio_bytes: bytes, mime_type: str = "audio/o
 
 # ─── TTS (ElevenLabs + fallback Google TTS) ──────────────────────────────────
 
+def _gtts_sync(texto: str) -> bytes:
+    """Gera MP3 via gTTS e converte para OGG/OPUS com ffmpeg (formato exigido pelo Telegram voice)."""
+    tts = gTTS(text=texto[:500], lang="pt", slow=False)
+    mp3_buf = io.BytesIO()
+    tts.write_to_fp(mp3_buf)
+    mp3_buf.seek(0)
+    mp3_bytes = mp3_buf.read()
+
+    # Converter MP3 → OGG/OPUS via ffmpeg
+    proc = subprocess.run(
+        ["ffmpeg", "-y", "-f", "mp3", "-i", "pipe:0",
+         "-c:a", "libopus", "-b:a", "64k", "-f", "ogg", "pipe:1"],
+        input=mp3_bytes,
+        capture_output=True
+    )
+    if proc.returncode == 0 and proc.stdout:
+        return proc.stdout
+    # Fallback: retorna MP3 mesmo (reply_audio funciona, voice pode rejeitar)
+    return mp3_bytes
+
 async def gtts_audio(texto: str) -> bytes | None:
-    """Gera áudio via Google TTS. Retorna bytes ou None."""
+    """Gera áudio OGG via gTTS+ffmpeg em thread separada. Retorna bytes ou None."""
     try:
-        tts = gTTS(text=texto[:500], lang="pt", slow=False)
-        buf = io.BytesIO()
-        tts.write_to_fp(buf)
-        buf.seek(0)
-        return buf.read()
+        loop = asyncio.get_event_loop()
+        return await loop.run_in_executor(None, _gtts_sync, texto)
     except Exception as e:
         logger.error(f"Erro gTTS: {e}")
         return None
 
+def _mp3_to_ogg(mp3_bytes: bytes) -> bytes:
+    """Converte MP3 para OGG/OPUS via ffmpeg (formato aceito pelo Telegram reply_voice)."""
+    proc = subprocess.run(
+        ["ffmpeg", "-y", "-f", "mp3", "-i", "pipe:0",
+         "-c:a", "libopus", "-b:a", "64k", "-f", "ogg", "pipe:1"],
+        input=mp3_bytes,
+        capture_output=True
+    )
+    if proc.returncode == 0 and proc.stdout:
+        return proc.stdout
+    return mp3_bytes  # fallback: retorna MP3 sem conversão
+
 async def elevenlabs_audio(texto: str, voice_id: str) -> bytes | None:
-    """Gera áudio via ElevenLabs. Retorna bytes ou None."""
+    """Gera áudio OGG via ElevenLabs (MP3 convertido). Retorna bytes ou None."""
     if not ELEVENLABS_API_KEY:
         return None
     try:
@@ -267,7 +297,9 @@ async def elevenlabs_audio(texto: str, voice_id: str) -> bytes | None:
         async with aiohttp.ClientSession() as session:
             async with session.post(url, headers=headers, json=payload, timeout=aiohttp.ClientTimeout(total=30)) as resp:
                 if resp.status == 200:
-                    return await resp.read()
+                    mp3 = await resp.read()
+                    loop = asyncio.get_event_loop()
+                    return await loop.run_in_executor(None, _mp3_to_ogg, mp3)
                 logger.error(f"ElevenLabs status {resp.status}: {await resp.text()}")
     except Exception as e:
         logger.error(f"Erro ElevenLabs TTS: {e}")
