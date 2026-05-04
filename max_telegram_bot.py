@@ -565,11 +565,74 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         logger.error(f"Erro descrição: {e}")
         await update.message.reply_text("Não consegui descrever essa imagem. Tenta de novo!")
 
+async def transcrever_audio(audio_bytes: bytes, mime_type: str = "audio/ogg") -> str:
+    url = "https://api.groq.com/openai/v1/audio/transcriptions"
+    headers = {"Authorization": f"Bearer {GROQ_API_KEY}"}
+    ext = "ogg"
+    if "mp4" in mime_type or "m4a" in mime_type:
+        ext = "m4a"
+    elif "mpeg" in mime_type or "mp3" in mime_type:
+        ext = "mp3"
+    elif "wav" in mime_type:
+        ext = "wav"
+    form_data = aiohttp.FormData()
+    form_data.add_field("file", audio_bytes, filename=f"audio.{ext}", content_type=mime_type)
+    form_data.add_field("model", "whisper-large-v3")
+    form_data.add_field("language", "pt")
+    form_data.add_field("response_format", "text")
+    async with aiohttp.ClientSession() as session:
+        async with session.post(url, headers=headers, data=form_data) as resp:
+            if resp.status == 200:
+                return (await resp.text()).strip()
+            else:
+                logger.error(f"Erro Whisper: {resp.status} - {await resp.text()}")
+                return None
+
 async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "Recebi seu áudio! Ainda não consigo transcrever voz, mas em breve vou ter essa função. "
-        "Por enquanto, manda em texto mesmo!"
-    )
+    """Áudio → transcreve com Whisper → responde em áudio via ElevenLabs"""
+    chat_id = update.effective_chat.id
+    user_id = update.effective_user.id
+
+    await context.bot.send_chat_action(chat_id=chat_id, action=ChatAction.TYPING)
+
+    voice = update.message.voice
+    voice_file = await context.bot.get_file(voice.file_id)
+
+    async with aiohttp.ClientSession() as session:
+        async with session.get(voice_file.file_path) as resp:
+            audio_bytes = await resp.read()
+
+    transcricao = await transcrever_audio(audio_bytes, mime_type="audio/ogg")
+
+    if not transcricao:
+        await update.message.reply_text("Não consegui entender o áudio. Tenta de novo?")
+        return
+
+    logger.info(f"Transcrição: {transcricao}")
+
+    if user_id not in user_history:
+        user_history[user_id] = []
+
+    user_history[user_id].append({"role": "user", "content": transcricao})
+    if len(user_history[user_id]) > 20:
+        user_history[user_id] = user_history[user_id][-20:]
+
+    try:
+        resposta = await perguntar_ia(user_history[user_id])
+        user_history[user_id].append({"role": "assistant", "content": resposta})
+
+        await context.bot.send_chat_action(chat_id=chat_id, action=ChatAction.RECORD_VOICE)
+        voice_id = get_voice_id(user_id)
+        audio_resposta = await texto_para_audio(resposta, voice_id=voice_id)
+
+        if audio_resposta:
+            await update.message.reply_voice(voice=audio_resposta)
+        else:
+            await update.message.reply_text(resposta)
+
+    except Exception as e:
+        logger.error(f"Erro no handle_voice: {e}")
+        await update.message.reply_text("Deu um erro aqui. Tenta de novo!")
 
 def main():
     app = Application.builder().token(TELEGRAM_TOKEN).build()
