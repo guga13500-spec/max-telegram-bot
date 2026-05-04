@@ -26,39 +26,68 @@ DATA_CRIACAO = "01 de maio de 2025"
 
 # ─── RATE LIMIT ──────────────────────────────────────────────────────────────
 
-LIMITE_MSGS_POR_HORA = 20
-LIMITE_AUDIO_POR_HORA = 10   # ElevenLabs tem cota mensal, controlar mais
+LIMITE_MSGS_POR_DIA   = 140          # mensagens de texto por dia
+LIMITE_AUDIO_SEG_DIA  = 3600         # 1 hora de áudio enviado por dia (em segundos)
 
-# user_id -> lista de timestamps das mensagens na última hora
+# user_id -> lista de timestamps das mensagens no dia atual
 user_msg_timestamps: dict[int, list] = defaultdict(list)
-user_audio_timestamps: dict[int, list] = defaultdict(list)
+# user_id -> segundos totais de áudio enviados hoje
+user_audio_segundos: dict[int, float] = defaultdict(float)
+# user_id -> data (date) em que os contadores foram zerados
+user_audio_reset_dia: dict[int, object] = {}
+
+def _inicio_do_dia(agora: datetime) -> datetime:
+    """Meia-noite no fuso horário do Brasil."""
+    return agora.replace(hour=0, minute=0, second=0, microsecond=0)
 
 def checar_rate_limit(user_id: int, tipo: str = "msg") -> tuple[bool, int]:
     """
     Retorna (pode_usar, segundos_ate_liberar).
-    segundos_ate_liberar só é relevante quando pode_usar=False.
+    Para tipo='msg': conta mensagens no dia.
+    Para tipo='audio': não registra aqui — use registrar_audio_segundos().
     """
     agora = datetime.now(BR_TIMEZONE)
-    uma_hora_atras = agora - timedelta(hours=1)
+    inicio_dia = _inicio_do_dia(agora)
 
-    if tipo == "audio":
-        timestamps = user_audio_timestamps[user_id]
-        limite = LIMITE_AUDIO_POR_HORA
-    else:
+    if tipo == "msg":
         timestamps = user_msg_timestamps[user_id]
-        limite = LIMITE_MSGS_POR_HORA
+        # Limpar registros de dias anteriores
+        timestamps[:] = [t for t in timestamps if t >= inicio_dia]
 
-    # Limpar timestamps antigos
-    timestamps[:] = [t for t in timestamps if t > uma_hora_atras]
+        if len(timestamps) >= LIMITE_MSGS_POR_DIA:
+            # Libera na meia-noite do próximo dia
+            amanha = inicio_dia + timedelta(days=1)
+            segundos = max(0, int((amanha - agora).total_seconds()))
+            return False, segundos
 
-    if len(timestamps) >= limite:
-        # Quando o mais antigo da janela vai sair
-        mais_antigo = timestamps[0]
-        libera_em = mais_antigo + timedelta(hours=1)
-        segundos = max(0, int((libera_em - agora).total_seconds()))
+        timestamps.append(agora)
+        return True, 0
+
+    return True, 0  # audio é checado separadamente
+
+def checar_limite_audio(user_id: int, duracao_segundos: float) -> tuple[bool, int]:
+    """
+    Verifica se o usuário ainda tem cota de áudio para hoje.
+    duracao_segundos: duração do áudio que ele quer enviar.
+    Retorna (pode_usar, segundos_ate_liberar).
+    """
+    agora = datetime.now(BR_TIMEZONE)
+    hoje = agora.date()
+
+    # Resetar contador se mudou o dia
+    if user_audio_reset_dia.get(user_id) != hoje:
+        user_audio_segundos[user_id] = 0.0
+        user_audio_reset_dia[user_id] = hoje
+
+    total = user_audio_segundos[user_id]
+
+    if total + duracao_segundos > LIMITE_AUDIO_SEG_DIA:
+        # Libera na meia-noite
+        amanha = datetime.combine(hoje + timedelta(days=1), datetime.min.time()).replace(tzinfo=BR_TIMEZONE)
+        segundos = max(0, int((amanha - agora).total_seconds()))
         return False, segundos
 
-    timestamps.append(agora)
+    user_audio_segundos[user_id] += duracao_segundos
     return True, 0
 
 def formatar_espera(segundos: int) -> str:
@@ -68,6 +97,9 @@ def formatar_espera(segundos: int) -> str:
     if minutos < 60:
         return f"{minutos} minuto{'s' if minutos > 1 else ''}"
     horas = minutos // 60
+    resto = minutos % 60
+    if resto:
+        return f"{horas}h{resto}min"
     return f"{horas} hora{'s' if horas > 1 else ''}"
 
 # ─── VOZES ELEVENLABS ────────────────────────────────────────────────────────
@@ -439,12 +471,12 @@ async def processar_audio_resposta(update: Update, context, pergunta: str):
     chat_id = update.effective_chat.id
     user_id = update.effective_user.id
 
-    # Rate limit para áudio
-    pode, espera = checar_rate_limit(user_id, tipo="audio")
-    if not pode:
+    # Rate limit de mensagem
+    pode_msg, espera_msg = checar_rate_limit(user_id, tipo="msg")
+    if not pode_msg:
         await update.message.reply_text(
-            f"Você atingiu o limite de áudios por hora.\n"
-            f"Tenta de novo em {formatar_espera(espera)}."
+            f"Você atingiu o limite diário de mensagens.\n"
+            f"Tenta de novo em {formatar_espera(espera_msg)}."
         )
         return
 
@@ -689,23 +721,24 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
     pode_msg, espera_msg = checar_rate_limit(user_id, tipo="msg")
     if not pode_msg:
         await update.message.reply_text(
-            f"Limite atingido. Tenta de novo em {formatar_espera(espera_msg)}."
+            f"Limite diário atingido. Tenta de novo em {formatar_espera(espera_msg)}."
         )
         return
 
-    # Rate limit de áudio (resposta usa ElevenLabs)
-    pode_audio, espera_audio = checar_rate_limit(user_id, tipo="audio")
+    # Checar limite de áudio ENVIADO pelo usuário (1h/dia)
+    voice_meta = update.message.voice
+    duracao = voice_meta.duration if voice_meta else 0
+    pode_audio, espera_audio = checar_limite_audio(user_id, duracao)
     if not pode_audio:
         await update.message.reply_text(
-            f"Você atingiu o limite de áudios por hora.\n"
+            f"Você atingiu o limite de 1 hora de áudio por dia.\n"
             f"Tenta de novo em {formatar_espera(espera_audio)}."
         )
         return
 
     await context.bot.send_chat_action(chat_id=chat_id, action=ChatAction.TYPING)
 
-    voice = update.message.voice
-    voice_file = await context.bot.get_file(voice.file_id)
+    voice_file = await context.bot.get_file(voice_meta.file_id)
 
     async with aiohttp.ClientSession() as session:
         async with session.get(voice_file.file_path) as resp:
