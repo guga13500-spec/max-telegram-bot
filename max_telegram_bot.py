@@ -3,7 +3,8 @@ import logging
 import asyncio
 import aiohttp
 import base64
-from datetime import datetime
+from datetime import datetime, timedelta
+from collections import defaultdict
 import pytz
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.constants import ChatAction
@@ -20,6 +21,52 @@ ELEVENLABS_MODEL = "eleven_multilingual_v2"
 
 BR_TIMEZONE = pytz.timezone("America/Sao_Paulo")
 DATA_CRIACAO = "01 de maio de 2025"
+
+# ─── RATE LIMIT ──────────────────────────────────────────────────────────────
+
+LIMITE_MSGS_POR_HORA = 20
+LIMITE_AUDIO_POR_HORA = 10   # ElevenLabs tem cota mensal, controlar mais
+
+# user_id -> lista de timestamps das mensagens na última hora
+user_msg_timestamps: dict[int, list] = defaultdict(list)
+user_audio_timestamps: dict[int, list] = defaultdict(list)
+
+def checar_rate_limit(user_id: int, tipo: str = "msg") -> tuple[bool, int]:
+    """
+    Retorna (pode_usar, segundos_ate_liberar).
+    segundos_ate_liberar só é relevante quando pode_usar=False.
+    """
+    agora = datetime.now(BR_TIMEZONE)
+    uma_hora_atras = agora - timedelta(hours=1)
+
+    if tipo == "audio":
+        timestamps = user_audio_timestamps[user_id]
+        limite = LIMITE_AUDIO_POR_HORA
+    else:
+        timestamps = user_msg_timestamps[user_id]
+        limite = LIMITE_MSGS_POR_HORA
+
+    # Limpar timestamps antigos
+    timestamps[:] = [t for t in timestamps if t > uma_hora_atras]
+
+    if len(timestamps) >= limite:
+        # Quando o mais antigo da janela vai sair
+        mais_antigo = timestamps[0]
+        libera_em = mais_antigo + timedelta(hours=1)
+        segundos = max(0, int((libera_em - agora).total_seconds()))
+        return False, segundos
+
+    timestamps.append(agora)
+    return True, 0
+
+def formatar_espera(segundos: int) -> str:
+    if segundos < 60:
+        return f"{segundos} segundos"
+    minutos = segundos // 60
+    if minutos < 60:
+        return f"{minutos} minuto{'s' if minutos > 1 else ''}"
+    horas = minutos // 60
+    return f"{horas} hora{'s' if horas > 1 else ''}"
 
 # ─── VOZES ELEVENLABS ────────────────────────────────────────────────────────
 
@@ -50,7 +97,8 @@ VOZES_ELEVENLABS = [
 VOZES_POR_PAGINA = 5
 DEFAULT_VOICE_ID = "nPczCjzI2devNBz1zQrb"  # Brian
 
-user_voice = {}
+# user_id -> voice_id
+user_voice: dict[int, str] = {}
 
 def get_voice_id(user_id: int) -> str:
     return user_voice.get(user_id, DEFAULT_VOICE_ID)
@@ -67,6 +115,7 @@ O que você consegue fazer:
 - Ajudar com programação e código
 - Dizer o horário atual, dia da semana e previsão do tempo
 - Responder em áudio quando pedido
+- Transcrever mensagens de voz e responder em áudio
 
 O que você NÃO faz: não manda mensagem para outros usuários do Telegram.
 
@@ -76,8 +125,8 @@ Quando descrever imagens, seja detalhado — pense que a pessoa não pode ver.
 Se perguntarem quando você foi criado: {DATA_CRIACAO}.
 Se perguntarem quem te criou: Zapia em parceria com o Gustavo."""
 
-user_history = {}
-user_waiting = {}
+user_history: dict[int, list] = {}
+user_waiting: dict[int, str] = {}
 
 # ─── TEMPO / DATA ─────────────────────────────────────────────────────────────
 
@@ -102,40 +151,38 @@ async def get_previsao_tempo(cidade="Salto"):
         logger.error(f"Erro tempo: {e}")
         return "Erro ao buscar previsão do tempo."
 
-# ─── GEMINI ──────────────────────────────────────────────────────────────────
+# ─── IA (100% Gemini) ────────────────────────────────────────────────────────
 
 async def perguntar_gemini(mensagens: list) -> str:
     dt = get_datetime_info()
-    sys_text = SYSTEM_PROMPT + f"\n\nAgora são {dt['hora']} de {dt['dia_semana']}, {dt['data']} (horário de Brasília)."
+    sys_prompt = SYSTEM_PROMPT + f"\n\nAgora são {dt['hora']} de {dt['dia_semana']}, {dt['data']} (horário de Brasília)."
     url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key={GEMINI_API_KEY}"
     contents = []
     for msg in mensagens:
         role = "user" if msg["role"] == "user" else "model"
-        if isinstance(msg.get("content"), list):
-            parts = msg["content"]
-        else:
-            parts = [{"text": msg["content"]}]
-        contents.append({"role": role, "parts": parts})
+        contents.append({"role": role, "parts": [{"text": msg["content"]}]})
     payload = {
-        "system_instruction": {"parts": [{"text": sys_text}]},
+        "system_instruction": {"parts": [{"text": sys_prompt}]},
         "contents": contents,
         "generationConfig": {"maxOutputTokens": 1024}
     }
-    async with aiohttp.ClientSession() as session:
-        async with session.post(url, json=payload, timeout=aiohttp.ClientTimeout(total=30)) as resp:
-            result = await resp.json()
-            if "candidates" in result:
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.post(url, json=payload, timeout=aiohttp.ClientTimeout(total=30)) as resp:
+                result = await resp.json()
                 return result["candidates"][0]["content"]["parts"][0]["text"]
-            else:
-                logger.error(f"Gemini erro: {result}")
-                return "Eita, deu um erro aqui. Tenta de novo!"
+    except Exception as e:
+        logger.error(f"Erro Gemini: {e}")
+        raise
+
+async def perguntar_ia(mensagens: list) -> str:
+    return await perguntar_gemini(mensagens)
 
 async def descrever_imagem_gemini(image_bytes: bytes) -> str:
     b64 = base64.b64encode(image_bytes).decode()
     url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key={GEMINI_API_KEY}"
     payload = {
         "contents": [{
-            "role": "user",
             "parts": [
                 {"text": "Descreva essa imagem detalhadamente para uma pessoa cega. Seja preciso sobre cores, formas, pessoas, expressões, texto visível e contexto geral."},
                 {"inline_data": {"mime_type": "image/jpeg", "data": b64}}
@@ -143,40 +190,42 @@ async def descrever_imagem_gemini(image_bytes: bytes) -> str:
         }],
         "generationConfig": {"maxOutputTokens": 1024}
     }
-    async with aiohttp.ClientSession() as session:
-        async with session.post(url, json=payload, timeout=aiohttp.ClientTimeout(total=30)) as resp:
-            result = await resp.json()
-            if "candidates" in result:
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.post(url, json=payload, timeout=aiohttp.ClientTimeout(total=30)) as resp:
+                result = await resp.json()
                 return result["candidates"][0]["content"]["parts"][0]["text"]
-            else:
-                logger.error(f"Gemini visão erro: {result}")
-                return "Não consegui descrever a imagem agora."
+    except Exception as e:
+        logger.error(f"Erro Gemini visão: {e}")
+        raise
 
 async def transcrever_audio_gemini(audio_bytes: bytes, mime_type: str = "audio/ogg") -> str:
     b64 = base64.b64encode(audio_bytes).decode()
     url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key={GEMINI_API_KEY}"
     payload = {
         "contents": [{
-            "role": "user",
             "parts": [
-                {"text": "Transcreva exatamente o que está sendo dito neste áudio em português. Retorne apenas a transcrição, sem comentários adicionais."},
+                {"text": "Transcreva exatamente o que foi dito nesse áudio em português. Retorne apenas o texto transcrito, sem comentários adicionais."},
                 {"inline_data": {"mime_type": mime_type, "data": b64}}
             ]
-        }],
-        "generationConfig": {"maxOutputTokens": 512}
+        }]
     }
-    async with aiohttp.ClientSession() as session:
-        async with session.post(url, json=payload, timeout=aiohttp.ClientTimeout(total=30)) as resp:
-            result = await resp.json()
-            if "candidates" in result:
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.post(url, json=payload, timeout=aiohttp.ClientTimeout(total=30)) as resp:
+                result = await resp.json()
                 return result["candidates"][0]["content"]["parts"][0]["text"].strip()
-            else:
-                logger.error(f"Gemini áudio erro: {result}")
-                return None
+    except Exception as e:
+        logger.error(f"Erro Gemini áudio: {e}")
+        return None
 
-# ─── TTS (ElevenLabs) ─────────────────────────────────────────────────────────
+# ─── TTS (ElevenLabs + fallback Google TTS) ──────────────────────────────────
 
-async def texto_para_audio(texto: str, voice_id: str = DEFAULT_VOICE_ID):
+async def texto_para_audio(texto: str, voice_id: str = DEFAULT_VOICE_ID) -> tuple[bytes | None, bool]:
+    """
+    Retorna (audio_bytes, usou_elevenlabs).
+    usou_elevenlabs=False indica que caiu no fallback.
+    """
     if ELEVENLABS_API_KEY:
         try:
             texto_limitado = texto[:500]
@@ -194,10 +243,12 @@ async def texto_para_audio(texto: str, voice_id: str = DEFAULT_VOICE_ID):
             async with aiohttp.ClientSession() as session:
                 async with session.post(url, headers=headers, json=payload, timeout=aiohttp.ClientTimeout(total=30)) as resp:
                     if resp.status == 200:
-                        return await resp.read()
+                        return await resp.read(), True
                     logger.error(f"ElevenLabs status {resp.status}: {await resp.text()}")
         except Exception as e:
             logger.error(f"Erro ElevenLabs TTS: {e}")
+
+    # Fallback: Google TTS público
     try:
         texto_curto = texto[:200]
         url = f"https://translate.google.com/translate_tts?ie=UTF-8&q={quote(texto_curto)}&tl=pt-BR&client=tw-ob"
@@ -205,16 +256,18 @@ async def texto_para_audio(texto: str, voice_id: str = DEFAULT_VOICE_ID):
         async with aiohttp.ClientSession() as session:
             async with session.get(url, headers=headers, timeout=aiohttp.ClientTimeout(total=15)) as resp:
                 if resp.status == 200:
-                    return await resp.read()
+                    return await resp.read(), False
     except Exception as e:
         logger.error(f"Erro TTS fallback: {e}")
-    return None
 
-async def preview_voz(voice_id: str):
+    return None, False
+
+async def preview_voz(voice_id: str) -> bytes | None:
     if not ELEVENLABS_API_KEY:
         return None
     texto = "Olá! Eu sou o Max. Essa é uma amostra da minha voz."
-    return await texto_para_audio(texto, voice_id=voice_id)
+    audio, _ = await texto_para_audio(texto, voice_id=voice_id)
+    return audio
 
 # ─── IMAGEM ──────────────────────────────────────────────────────────────────
 
@@ -225,7 +278,7 @@ async def gerar_imagem(prompt: str) -> bytes:
         async with session.get(url, timeout=aiohttp.ClientTimeout(total=60)) as resp:
             return await resp.read()
 
-# ─── MENU ────────────────────────────────────────────────────────────────────
+# ─── MENUS ───────────────────────────────────────────────────────────────────
 
 def menu_principal():
     keyboard = [
@@ -245,7 +298,9 @@ def menu_principal():
             InlineKeyboardButton("🔊 Resposta em Áudio", callback_data="menu_audio"),
             InlineKeyboardButton("🎙️ Escolher Voz", callback_data="vozes_pg_0"),
         ],
-        [InlineKeyboardButton("❓ Ajuda", callback_data="menu_ajuda")]
+        [
+            InlineKeyboardButton("❓ Ajuda", callback_data="menu_ajuda"),
+        ]
     ]
     return InlineKeyboardMarkup(keyboard)
 
@@ -254,13 +309,17 @@ def menu_vozes(pagina: int, user_id: int):
     fim = inicio + VOZES_POR_PAGINA
     vozes_pagina = VOZES_ELEVENLABS[inicio:fim]
     voz_atual = get_voice_id(user_id)
+
     keyboard = []
     for v in vozes_pagina:
         marca = " ✅" if v["id"] == voz_atual else ""
-        keyboard.append([InlineKeyboardButton(
-            f"🎙️ {v['nome']} — {v['desc']}{marca}",
-            callback_data=f"voz_info_{v['id']}"
-        )])
+        keyboard.append([
+            InlineKeyboardButton(
+                f"🎙️ {v['nome']} — {v['desc']}{marca}",
+                callback_data=f"voz_info_{v['id']}"
+            )
+        ])
+
     nav = []
     total_pags = (len(VOZES_ELEVENLABS) + VOZES_POR_PAGINA - 1) // VOZES_POR_PAGINA
     if pagina > 0:
@@ -269,6 +328,7 @@ def menu_vozes(pagina: int, user_id: int):
         nav.append(InlineKeyboardButton("Próxima ▶", callback_data=f"vozes_pg_{pagina + 1}"))
     if nav:
         keyboard.append(nav)
+
     keyboard.append([InlineKeyboardButton("🏠 Menu Principal", callback_data="menu_principal")])
     return InlineKeyboardMarkup(keyboard)
 
@@ -299,7 +359,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     texto = (
         f"E aí, {user_name}! Sou o Max 👊\n\n"
         f"IA brasileira sem censura, criada em {DATA_CRIACAO}.\n\n"
-        "Converso, gero imagens, descrevo fotos, programo com você e muito mais.\n\n"
+        "Converso, gero imagens, descrevo fotos, transcrevo áudios e muito mais.\n\n"
         "O que você quer fazer?"
     )
     await update.message.reply_text(texto, reply_markup=menu_principal())
@@ -324,9 +384,10 @@ async def cmd_ajuda(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "• Converso sem filtro sobre qualquer coisa\n"
         "• Gero imagens a partir de texto\n"
         "• Descrevo imagens com detalhes (para cegos)\n"
+        "• Transcrevo mensagens de voz e respondo em áudio\n"
         "• Ajudo com programação\n"
         "• Digo hora, data e previsão do tempo\n"
-        "• Respondo em áudio (você escolhe a voz!)\n\n"
+        "• Você escolhe a voz do áudio (21 vozes!)\n\n"
         "Comandos:\n"
         "/start → apresentação\n"
         "/menu → menu principal\n"
@@ -370,30 +431,59 @@ async def cmd_audio(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     await processar_audio_resposta(update, context, " ".join(context.args))
 
+# ─── PROCESSADORES ───────────────────────────────────────────────────────────
+
 async def processar_audio_resposta(update: Update, context, pergunta: str):
     chat_id = update.effective_chat.id
     user_id = update.effective_user.id
+
+    # Rate limit para áudio
+    pode, espera = checar_rate_limit(user_id, tipo="audio")
+    if not pode:
+        await update.message.reply_text(
+            f"Você atingiu o limite de áudios por hora.\n"
+            f"Tenta de novo em {formatar_espera(espera)}."
+        )
+        return
+
     await context.bot.send_chat_action(chat_id=chat_id, action=ChatAction.RECORD_VOICE)
+
     if user_id not in user_history:
         user_history[user_id] = []
+
     user_history[user_id].append({"role": "user", "content": pergunta})
+
     try:
-        resposta_texto = await perguntar_gemini(user_history[user_id])
+        resposta_texto = await perguntar_ia(user_history[user_id])
         user_history[user_id].append({"role": "assistant", "content": resposta_texto})
+
         voice_id = get_voice_id(user_id)
-        audio_bytes = await texto_para_audio(resposta_texto, voice_id=voice_id)
+        audio_bytes, usou_elevenlabs = await texto_para_audio(resposta_texto, voice_id=voice_id)
+
         if audio_bytes:
             await update.message.reply_voice(voice=audio_bytes)
+            if not usou_elevenlabs:
+                await update.message.reply_text("(Áudio gerado com qualidade reduzida — voz ElevenLabs temporariamente indisponível)")
             if len(resposta_texto) > 200:
                 await update.message.reply_text(f"(Texto completo):\n{resposta_texto}")
         else:
             await update.message.reply_text(f"Áudio indisponível agora. Resposta:\n\n{resposta_texto}")
+
     except Exception as e:
         logger.error(f"Erro audio: {e}")
         await update.message.reply_text("Deu ruim no áudio. Tenta de novo!")
 
 async def processar_imagem(update: Update, prompt: str):
     msg = update.message if update.message else update.callback_query.message
+
+    user_id = msg.chat.id
+    pode, espera = checar_rate_limit(user_id, tipo="msg")
+    if not pode:
+        await msg.reply_text(
+            f"Limite de mensagens atingido.\nTenta de novo em {formatar_espera(espera)}."
+        )
+        return
+
     aviso = await msg.reply_text(f"Gerando: {prompt}... aguenta aí!")
     try:
         img_bytes = await gerar_imagem(prompt)
@@ -411,16 +501,20 @@ async def processar_imagem(update: Update, prompt: str):
             pass
         await msg.reply_text("Deu ruim na geração. Tenta de novo!")
 
+# ─── CALLBACK ────────────────────────────────────────────────────────────────
+
 async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     data = query.data
     user_id = query.from_user.id
 
+    # ── Menu principal ──
     if data == "menu_principal":
         await query.message.reply_text("O que você quer fazer?", reply_markup=menu_principal())
         return
 
+    # ── Navegação de vozes: vozes_pg_N ──
     if data.startswith("vozes_pg_"):
         pagina = int(data.split("_")[2])
         voz_atual = get_voice_id(user_id)
@@ -431,6 +525,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
+    # ── Detalhe de voz: voz_info_<id> ──
     if data.startswith("voz_info_"):
         voice_id = data[len("voz_info_"):]
         voz = next((v for v in VOZES_ELEVENLABS if v["id"] == voice_id), None)
@@ -447,6 +542,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
+    # ── Preview de voz: voz_preview_<id>_<pagina> ──
     if data.startswith("voz_preview_"):
         parts = data.split("_")
         voice_id = parts[2]
@@ -466,6 +562,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.message.reply_text("Não consegui gerar o preview agora. Tenta de novo!")
         return
 
+    # ── Usar voz: voz_usar_<id>_<pagina> ──
     if data.startswith("voz_usar_"):
         parts = data.split("_")
         voice_id = parts[2]
@@ -479,6 +576,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
+    # ── Menus originais ──
     if data == "menu_imagem":
         user_waiting[user_id] = "imagem"
         await query.message.reply_text("Descreve a imagem que você quer e eu gero!")
@@ -506,18 +604,32 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.message.reply_text(
             f"Sou o Max — criado em {DATA_CRIACAO}!\n\n"
             "• Conversa sem filtro\n• Gera imagens\n• Descreve fotos\n"
-            "• Programa contigo\n• Hora e previsão do tempo\n• Resposta em áudio\n"
-            "• Escolher voz do ElevenLabs\n\n"
+            "• Transcreve áudios\n• Programa contigo\n• Hora e previsão do tempo\n"
+            "• Resposta em áudio\n• Escolher voz do ElevenLabs\n\n"
             f"Agora são {dt['hora']} de {dt['dia_semana']}.\n\nUse /menu para voltar!"
         )
+
+# ─── MENSAGEM DE TEXTO ────────────────────────────────────────────────────────
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     user_id = update.effective_user.id
     text = update.message.text
+
+    # Rate limit
+    pode, espera = checar_rate_limit(user_id, tipo="msg")
+    if not pode:
+        await update.message.reply_text(
+            f"Você mandou muitas mensagens. Calma aí!\n"
+            f"Tenta de novo em {formatar_espera(espera)}."
+        )
+        return
+
     await context.bot.send_chat_action(chat_id=chat_id, action=ChatAction.TYPING)
+
     if user_id not in user_history:
         user_history[user_id] = []
+
     waiting = user_waiting.pop(user_id, None)
     if waiting == "imagem":
         await processar_imagem(update, text)
@@ -525,24 +637,39 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if waiting == "audio":
         await processar_audio_resposta(update, context, text)
         return
+
     user_history[user_id].append({"role": "user", "content": text})
     if len(user_history[user_id]) > 30:
         user_history[user_id] = user_history[user_id][-30:]
+
     try:
-        resposta = await perguntar_gemini(user_history[user_id])
+        resposta = await perguntar_ia(user_history[user_id])
         user_history[user_id].append({"role": "assistant", "content": resposta})
         await update.message.reply_text(resposta)
     except Exception as e:
         logger.error(f"Erro: {e}")
         await update.message.reply_text("Eita, deu um erro. Tenta de novo!")
 
+# ─── FOTO ────────────────────────────────────────────────────────────────────
+
 async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+
+    pode, espera = checar_rate_limit(user_id, tipo="msg")
+    if not pode:
+        await update.message.reply_text(
+            f"Limite atingido. Tenta de novo em {formatar_espera(espera)}."
+        )
+        return
+
     await context.bot.send_chat_action(chat_id=update.effective_chat.id, action=ChatAction.TYPING)
     photo = update.message.photo[-1]
     file = await context.bot.get_file(photo.file_id)
+
     async with aiohttp.ClientSession() as session:
         async with session.get(file.file_path) as resp:
             img_bytes = await resp.read()
+
     try:
         descricao = await descrever_imagem_gemini(img_bytes)
         await update.message.reply_text(f"Descrição da imagem:\n\n{descricao}")
@@ -550,38 +677,75 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         logger.error(f"Erro descrição: {e}")
         await update.message.reply_text("Não consegui descrever essa imagem. Tenta de novo!")
 
+# ─── VOZ ─────────────────────────────────────────────────────────────────────
+
 async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     user_id = update.effective_user.id
+
+    # Rate limit de mensagem (transcrição consome Gemini)
+    pode_msg, espera_msg = checar_rate_limit(user_id, tipo="msg")
+    if not pode_msg:
+        await update.message.reply_text(
+            f"Limite atingido. Tenta de novo em {formatar_espera(espera_msg)}."
+        )
+        return
+
+    # Rate limit de áudio (resposta usa ElevenLabs)
+    pode_audio, espera_audio = checar_rate_limit(user_id, tipo="audio")
+    if not pode_audio:
+        await update.message.reply_text(
+            f"Você atingiu o limite de áudios por hora.\n"
+            f"Tenta de novo em {formatar_espera(espera_audio)}."
+        )
+        return
+
     await context.bot.send_chat_action(chat_id=chat_id, action=ChatAction.TYPING)
+
     voice = update.message.voice
     voice_file = await context.bot.get_file(voice.file_id)
+
     async with aiohttp.ClientSession() as session:
         async with session.get(voice_file.file_path) as resp:
             audio_bytes = await resp.read()
+
     transcricao = await transcrever_audio_gemini(audio_bytes, mime_type="audio/ogg")
+
     if not transcricao:
         await update.message.reply_text("Não consegui entender o áudio. Tenta de novo?")
         return
+
     logger.info(f"Transcrição: {transcricao}")
+
     if user_id not in user_history:
         user_history[user_id] = []
+
     user_history[user_id].append({"role": "user", "content": transcricao})
     if len(user_history[user_id]) > 20:
         user_history[user_id] = user_history[user_id][-20:]
+
     try:
-        resposta = await perguntar_gemini(user_history[user_id])
+        resposta = await perguntar_ia(user_history[user_id])
         user_history[user_id].append({"role": "assistant", "content": resposta})
+
         await context.bot.send_chat_action(chat_id=chat_id, action=ChatAction.RECORD_VOICE)
         voice_id = get_voice_id(user_id)
-        audio_resposta = await texto_para_audio(resposta, voice_id=voice_id)
+        audio_resposta, usou_elevenlabs = await texto_para_audio(resposta, voice_id=voice_id)
+
         if audio_resposta:
             await update.message.reply_voice(voice=audio_resposta)
+            if not usou_elevenlabs:
+                await update.message.reply_text("(Voz com qualidade reduzida — ElevenLabs temporariamente indisponível)")
+            if len(resposta) > 200:
+                await update.message.reply_text(f"(Texto):\n{resposta}")
         else:
             await update.message.reply_text(resposta)
+
     except Exception as e:
         logger.error(f"Erro no handle_voice: {e}")
         await update.message.reply_text("Deu um erro aqui. Tenta de novo!")
+
+# ─── MAIN ────────────────────────────────────────────────────────────────────
 
 def main():
     app = Application.builder().token(TELEGRAM_TOKEN).build()
@@ -598,7 +762,7 @@ def main():
     app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     app.add_handler(MessageHandler(filters.VOICE, handle_voice))
-    logger.info("Max v3 — Gemini iniciado!")
+    logger.info("Max v5 — Gemini + Rate Limit + 21 Vozes iniciado!")
     app.run_polling(drop_pending_updates=True)
 
 if __name__ == "__main__":
