@@ -130,12 +130,16 @@ VOZES_ELEVENLABS = [
 
 VOZES_POR_PAGINA = 5
 DEFAULT_VOICE_ID = "nPczCjzI2devNBz1zQrb"  # Brian
+GOOGLE_VOICE_ID  = "google"                  # Google TTS (gratuito, sem limite)
 
-# user_id -> voice_id
+# user_id -> voice_id  (pode ser GOOGLE_VOICE_ID ou um id do ElevenLabs)
 user_voice: dict[int, str] = {}
 
 def get_voice_id(user_id: int) -> str:
     return user_voice.get(user_id, DEFAULT_VOICE_ID)
+
+def usa_elevenlabs(user_id: int) -> bool:
+    return get_voice_id(user_id) != GOOGLE_VOICE_ID
 
 SYSTEM_PROMPT = f"""Você é o Max, uma IA brasileira sem censura, direta e extremamente capaz.
 Criado em {DATA_CRIACAO} pela Zapia em parceria com o Gustavo.
@@ -256,51 +260,64 @@ async def transcrever_audio_gemini(audio_bytes: bytes, mime_type: str = "audio/o
 
 # ─── TTS (ElevenLabs + fallback Google TTS) ──────────────────────────────────
 
-async def texto_para_audio(texto: str, voice_id: str = DEFAULT_VOICE_ID) -> tuple[bytes | None, bool]:
-    """
-    Retorna (audio_bytes, usou_elevenlabs).
-    usou_elevenlabs=False indica que caiu no fallback.
-    """
-    if ELEVENLABS_API_KEY:
-        try:
-            texto_limitado = texto[:500]
-            url = f"https://api.elevenlabs.io/v1/text-to-speech/{voice_id}"
-            headers = {
-                "xi-api-key": ELEVENLABS_API_KEY,
-                "Content-Type": "application/json",
-                "Accept": "audio/mpeg"
-            }
-            payload = {
-                "text": texto_limitado,
-                "model_id": ELEVENLABS_MODEL,
-                "voice_settings": {"stability": 0.5, "similarity_boost": 0.75}
-            }
-            async with aiohttp.ClientSession() as session:
-                async with session.post(url, headers=headers, json=payload, timeout=aiohttp.ClientTimeout(total=30)) as resp:
-                    if resp.status == 200:
-                        return await resp.read(), True
-                    logger.error(f"ElevenLabs status {resp.status}: {await resp.text()}")
-        except Exception as e:
-            logger.error(f"Erro ElevenLabs TTS: {e}")
-
-    # Fallback: gTTS (biblioteca Python, mais confiável que URL pública)
+async def gtts_audio(texto: str) -> bytes | None:
+    """Gera áudio via Google TTS. Retorna bytes ou None."""
     try:
-        texto_curto = texto[:500]
-        tts = gTTS(text=texto_curto, lang="pt", slow=False)
+        tts = gTTS(text=texto[:500], lang="pt", slow=False)
         buf = io.BytesIO()
         tts.write_to_fp(buf)
         buf.seek(0)
-        return buf.read(), False
+        return buf.read()
     except Exception as e:
-        logger.error(f"Erro gTTS fallback: {e}")
+        logger.error(f"Erro gTTS: {e}")
+        return None
 
-    return None, False
-
-async def preview_voz(voice_id: str) -> bytes | None:
+async def elevenlabs_audio(texto: str, voice_id: str) -> bytes | None:
+    """Gera áudio via ElevenLabs. Retorna bytes ou None."""
     if not ELEVENLABS_API_KEY:
         return None
+    try:
+        url = f"https://api.elevenlabs.io/v1/text-to-speech/{voice_id}"
+        headers = {
+            "xi-api-key": ELEVENLABS_API_KEY,
+            "Content-Type": "application/json",
+            "Accept": "audio/mpeg"
+        }
+        payload = {
+            "text": texto[:500],
+            "model_id": ELEVENLABS_MODEL,
+            "voice_settings": {"stability": 0.5, "similarity_boost": 0.75}
+        }
+        async with aiohttp.ClientSession() as session:
+            async with session.post(url, headers=headers, json=payload, timeout=aiohttp.ClientTimeout(total=30)) as resp:
+                if resp.status == 200:
+                    return await resp.read()
+                logger.error(f"ElevenLabs status {resp.status}: {await resp.text()}")
+    except Exception as e:
+        logger.error(f"Erro ElevenLabs TTS: {e}")
+    return None
+
+async def texto_para_audio(texto: str, voice_id: str = DEFAULT_VOICE_ID) -> tuple[bytes | None, bool]:
+    """
+    Retorna (audio_bytes, usou_elevenlabs).
+    Se voice_id == GOOGLE_VOICE_ID, usa Google TTS diretamente.
+    Caso contrário tenta ElevenLabs; se falhar, cai no Google.
+    """
+    if voice_id == GOOGLE_VOICE_ID:
+        return await gtts_audio(texto), False
+
+    audio = await elevenlabs_audio(texto, voice_id)
+    if audio:
+        return audio, True
+
+    # Fallback silencioso para Google
+    return await gtts_audio(texto), False
+
+async def preview_voz(voice_id: str) -> bytes | None:
     texto = "Olá! Eu sou o Max. Essa é uma amostra da minha voz."
-    audio, _ = await texto_para_audio(texto, voice_id=voice_id)
+    if voice_id == GOOGLE_VOICE_ID:
+        return await gtts_audio(texto)
+    audio = await elevenlabs_audio(texto, voice_id)
     return audio
 
 # ─── IMAGEM ──────────────────────────────────────────────────────────────────
@@ -345,6 +362,17 @@ def menu_vozes(pagina: int, user_id: int):
     voz_atual = get_voice_id(user_id)
 
     keyboard = []
+
+    # Opção Google TTS no topo (só na primeira página)
+    if pagina == 0:
+        marca_google = " ✅" if voz_atual == GOOGLE_VOICE_ID else ""
+        keyboard.append([
+            InlineKeyboardButton(
+                f"🌐 Google TTS — Gratuito, sem limite{marca_google}",
+                callback_data="voz_usar_google_0"
+            )
+        ])
+
     for v in vozes_pagina:
         marca = " ✅" if v["id"] == voz_atual else ""
         keyboard.append([
@@ -552,9 +580,12 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if data.startswith("vozes_pg_"):
         pagina = int(data.split("_")[2])
         voz_atual = get_voice_id(user_id)
-        nome_atual = next((v["nome"] for v in VOZES_ELEVENLABS if v["id"] == voz_atual), "Brian")
+        if voz_atual == GOOGLE_VOICE_ID:
+            nome_atual = "Google TTS"
+        else:
+            nome_atual = next((v["nome"] for v in VOZES_ELEVENLABS if v["id"] == voz_atual), "Brian")
         await query.message.reply_text(
-            f"Voz atual: {nome_atual}\n\nEscolha uma voz do ElevenLabs:",
+            f"Voz atual: {nome_atual}\n\nEscolha a voz para seus áudios:",
             reply_markup=menu_vozes(pagina, user_id)
         )
         return
@@ -601,11 +632,16 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         parts = data.split("_")
         voice_id = parts[2]
         pagina = int(parts[3])
-        voz = next((v for v in VOZES_ELEVENLABS if v["id"] == voice_id), None)
-        nome = voz["nome"] if voz else voice_id
+        if voice_id == GOOGLE_VOICE_ID:
+            nome = "Google TTS"
+            descricao = "Voz do Google selecionada! Sem limites, sempre disponível."
+        else:
+            voz = next((v for v in VOZES_ELEVENLABS if v["id"] == voice_id), None)
+            nome = voz["nome"] if voz else voice_id
+            descricao = f"Voz {nome} (ElevenLabs) selecionada! Qualidade premium."
         user_voice[user_id] = voice_id
         await query.message.reply_text(
-            f"Voz {nome} selecionada! Agora todos os seus áudios vão usar essa voz.",
+            descricao,
             reply_markup=menu_vozes(pagina, user_id)
         )
         return
@@ -714,40 +750,45 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ─── VOZ ─────────────────────────────────────────────────────────────────────
 
 async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Usuário manda áudio → transcrevemos → Max responde em áudio com a voz escolhida.
+    - Se a voz for ElevenLabs e o limite diário for atingido,
+      o bot avisa com áudio usando Google TTS (nunca texto de erro).
+    - Se a voz for Google TTS, sem limite.
+    """
     chat_id = update.effective_chat.id
     user_id = update.effective_user.id
 
-    # Rate limit de mensagem (transcrição consome Gemini)
+    # Rate limit de mensagens
     pode_msg, espera_msg = checar_rate_limit(user_id, tipo="msg")
     if not pode_msg:
-        await update.message.reply_text(
-            f"Limite diário atingido. Tenta de novo em {formatar_espera(espera_msg)}."
-        )
-        return
-
-    # Checar limite de áudio ENVIADO pelo usuário (1h/dia)
-    voice_meta = update.message.voice
-    duracao = voice_meta.duration if voice_meta else 0
-    pode_audio, espera_audio = checar_limite_audio(user_id, duracao)
-    if not pode_audio:
-        await update.message.reply_text(
-            f"Você atingiu o limite de 1 hora de áudio por dia.\n"
-            f"Tenta de novo em {formatar_espera(espera_audio)}."
-        )
+        aviso = "Opa, você já conversou bastante comigo hoje! Dá um tempo e volta depois."
+        audio_aviso = await gtts_audio(aviso)
+        if audio_aviso:
+            await update.message.reply_voice(voice=audio_aviso)
+        else:
+            await update.message.reply_text(aviso)
         return
 
     await context.bot.send_chat_action(chat_id=chat_id, action=ChatAction.TYPING)
 
+    # Baixar e transcrever o áudio enviado pelo usuário
+    voice_meta = update.message.voice
     voice_file = await context.bot.get_file(voice_meta.file_id)
 
     async with aiohttp.ClientSession() as session:
         async with session.get(voice_file.file_path) as resp:
-            audio_bytes = await resp.read()
+            audio_bytes_in = await resp.read()
 
-    transcricao = await transcrever_audio_gemini(audio_bytes, mime_type="audio/ogg")
+    transcricao = await transcrever_audio_gemini(audio_bytes_in, mime_type="audio/ogg")
 
     if not transcricao:
-        await update.message.reply_text("Não consegui entender o áudio. Tenta de novo?")
+        aviso = "Não consegui entender o que você falou. Pode repetir?"
+        audio_aviso = await gtts_audio(aviso)
+        if audio_aviso:
+            await update.message.reply_voice(voice=audio_aviso)
+        else:
+            await update.message.reply_text(aviso)
         return
 
     logger.info(f"Transcrição: {transcricao}")
@@ -756,29 +797,55 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
         user_history[user_id] = []
 
     user_history[user_id].append({"role": "user", "content": transcricao})
-    if len(user_history[user_id]) > 20:
-        user_history[user_id] = user_history[user_id][-20:]
+    if len(user_history[user_id]) > 30:
+        user_history[user_id] = user_history[user_id][-30:]
 
     try:
         resposta = await perguntar_ia(user_history[user_id])
         user_history[user_id].append({"role": "assistant", "content": resposta})
 
         await context.bot.send_chat_action(chat_id=chat_id, action=ChatAction.RECORD_VOICE)
+
         voice_id = get_voice_id(user_id)
+
+        # Se é ElevenLabs, checar limite diário de áudio gerado
+        if voice_id != GOOGLE_VOICE_ID:
+            pode_el, _ = checar_limite_audio(user_id, len(resposta) / 15)  # estimativa de duração
+            if not pode_el:
+                aviso = (
+                    "Opa! Hoje já usei bastante o ElevenLabs por aqui. "
+                    "Você pode escolher a voz do Google no menu, que não tem limite. "
+                    "Amanhã a gente volta ao normal!"
+                )
+                audio_aviso = await gtts_audio(aviso)
+                if audio_aviso:
+                    await update.message.reply_voice(voice=audio_aviso)
+                else:
+                    await update.message.reply_text(aviso)
+                return
+
         audio_resposta, usou_elevenlabs = await texto_para_audio(resposta, voice_id=voice_id)
 
         if audio_resposta:
             await update.message.reply_voice(voice=audio_resposta)
-            if not usou_elevenlabs:
-                await update.message.reply_text("(Voz com qualidade reduzida — ElevenLabs temporariamente indisponível)")
-            if len(resposta) > 200:
-                await update.message.reply_text(f"(Texto):\n{resposta}")
+            # Se caiu no fallback Google sem querer (ElevenLabs caiu), avisa em áudio
+            if voice_id != GOOGLE_VOICE_ID and not usou_elevenlabs:
+                fallback_aviso = "Minha voz premium tá com problema agora, usei o Google. Tenta de novo em breve!"
+                audio_fb = await gtts_audio(fallback_aviso)
+                if audio_fb:
+                    await update.message.reply_voice(voice=audio_fb)
         else:
+            # Se nem áudio nem fallback funcionaram, aí manda texto
             await update.message.reply_text(resposta)
 
     except Exception as e:
         logger.error(f"Erro no handle_voice: {e}")
-        await update.message.reply_text("Deu um erro aqui. Tenta de novo!")
+        aviso = "Deu um problema aqui do meu lado. Pode tentar de novo?"
+        audio_err = await gtts_audio(aviso)
+        if audio_err:
+            await update.message.reply_voice(voice=audio_err)
+        else:
+            await update.message.reply_text(aviso)
 
 # ─── MAIN ────────────────────────────────────────────────────────────────────
 
