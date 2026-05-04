@@ -26,69 +26,45 @@ DATA_CRIACAO = "01 de maio de 2025"
 
 # ─── RATE LIMIT ──────────────────────────────────────────────────────────────
 
-LIMITE_MSGS_POR_DIA   = 140          # mensagens de texto por dia
-LIMITE_AUDIO_SEG_DIA  = 3600         # 1 hora de áudio enviado por dia (em segundos)
+LIMITE_MSGS_POR_DIA      = 140    # mensagens por dia
+LIMITE_ELEVEN_CHARS_DIA  = 50000  # ~1h de áudio gerado pelo ElevenLabs por dia (em caracteres)
 
 # user_id -> lista de timestamps das mensagens no dia atual
 user_msg_timestamps: dict[int, list] = defaultdict(list)
-# user_id -> segundos totais de áudio enviados hoje
-user_audio_segundos: dict[int, float] = defaultdict(float)
-# user_id -> data (date) em que os contadores foram zerados
-user_audio_reset_dia: dict[int, object] = {}
+# user_id -> caracteres gerados pelo ElevenLabs hoje
+user_eleven_chars: dict[int, int] = defaultdict(int)
+# user_id -> data em que o contador ElevenLabs foi zerado
+user_eleven_reset: dict[int, object] = {}
 
 def _inicio_do_dia(agora: datetime) -> datetime:
-    """Meia-noite no fuso horário do Brasil."""
     return agora.replace(hour=0, minute=0, second=0, microsecond=0)
 
 def checar_rate_limit(user_id: int, tipo: str = "msg") -> tuple[bool, int]:
-    """
-    Retorna (pode_usar, segundos_ate_liberar).
-    Para tipo='msg': conta mensagens no dia.
-    Para tipo='audio': não registra aqui — use registrar_audio_segundos().
-    """
     agora = datetime.now(BR_TIMEZONE)
     inicio_dia = _inicio_do_dia(agora)
 
-    if tipo == "msg":
-        timestamps = user_msg_timestamps[user_id]
-        # Limpar registros de dias anteriores
-        timestamps[:] = [t for t in timestamps if t >= inicio_dia]
+    timestamps = user_msg_timestamps[user_id]
+    timestamps[:] = [t for t in timestamps if t >= inicio_dia]
 
-        if len(timestamps) >= LIMITE_MSGS_POR_DIA:
-            # Libera na meia-noite do próximo dia
-            amanha = inicio_dia + timedelta(days=1)
-            segundos = max(0, int((amanha - agora).total_seconds()))
-            return False, segundos
+    if len(timestamps) >= LIMITE_MSGS_POR_DIA:
+        amanha = inicio_dia + timedelta(days=1)
+        return False, max(0, int((amanha - agora).total_seconds()))
 
-        timestamps.append(agora)
-        return True, 0
+    timestamps.append(agora)
+    return True, 0
 
-    return True, 0  # audio é checado separadamente
-
-def checar_limite_audio(user_id: int, duracao_segundos: float) -> tuple[bool, int]:
-    """
-    Verifica se o usuário ainda tem cota de áudio para hoje.
-    duracao_segundos: duração do áudio que ele quer enviar.
-    Retorna (pode_usar, segundos_ate_liberar).
-    """
+def checar_limite_elevenlabs(user_id: int, chars: int) -> bool:
+    """Retorna True se ainda tem cota ElevenLabs para hoje."""
     agora = datetime.now(BR_TIMEZONE)
     hoje = agora.date()
+    if user_eleven_reset.get(user_id) != hoje:
+        user_eleven_chars[user_id] = 0
+        user_eleven_reset[user_id] = hoje
+    return user_eleven_chars[user_id] + chars <= LIMITE_ELEVEN_CHARS_DIA
 
-    # Resetar contador se mudou o dia
-    if user_audio_reset_dia.get(user_id) != hoje:
-        user_audio_segundos[user_id] = 0.0
-        user_audio_reset_dia[user_id] = hoje
-
-    total = user_audio_segundos[user_id]
-
-    if total + duracao_segundos > LIMITE_AUDIO_SEG_DIA:
-        # Libera na meia-noite
-        amanha = datetime.combine(hoje + timedelta(days=1), datetime.min.time()).replace(tzinfo=BR_TIMEZONE)
-        segundos = max(0, int((amanha - agora).total_seconds()))
-        return False, segundos
-
-    user_audio_segundos[user_id] += duracao_segundos
-    return True, 0
+def registrar_uso_elevenlabs(user_id: int, chars: int):
+    """Registra caracteres usados no ElevenLabs hoje."""
+    user_eleven_chars[user_id] += chars
 
 def formatar_espera(segundos: int) -> str:
     if segundos < 60:
@@ -297,20 +273,26 @@ async def elevenlabs_audio(texto: str, voice_id: str) -> bytes | None:
         logger.error(f"Erro ElevenLabs TTS: {e}")
     return None
 
-async def texto_para_audio(texto: str, voice_id: str = DEFAULT_VOICE_ID) -> tuple[bytes | None, bool]:
+async def texto_para_audio(texto: str, user_id: int, voice_id: str = DEFAULT_VOICE_ID) -> tuple[bytes | None, bool]:
     """
     Retorna (audio_bytes, usou_elevenlabs).
     Se voice_id == GOOGLE_VOICE_ID, usa Google TTS diretamente.
-    Caso contrário tenta ElevenLabs; se falhar, cai no Google.
+    Caso contrário, checa limite ElevenLabs. Se no limite, retorna (None, False)
+    para que o caller decida o que fazer (avisar o usuário).
     """
     if voice_id == GOOGLE_VOICE_ID:
         return await gtts_audio(texto), False
 
+    chars = len(texto)
+    if not checar_limite_elevenlabs(user_id, chars):
+        return None, False  # limite atingido
+
     audio = await elevenlabs_audio(texto, voice_id)
     if audio:
+        registrar_uso_elevenlabs(user_id, chars)
         return audio, True
 
-    # Fallback silencioso para Google
+    # ElevenLabs falhou por erro técnico — fallback Google silencioso
     return await gtts_audio(texto), False
 
 async def preview_voz(voice_id: str) -> bytes | None:
@@ -520,16 +502,23 @@ async def processar_audio_resposta(update: Update, context, pergunta: str):
         user_history[user_id].append({"role": "assistant", "content": resposta_texto})
 
         voice_id = get_voice_id(user_id)
-        audio_bytes, usou_elevenlabs = await texto_para_audio(resposta_texto, voice_id=voice_id)
+        audio_bytes, usou_elevenlabs = await texto_para_audio(resposta_texto, user_id=user_id, voice_id=voice_id)
 
         if audio_bytes:
             await update.message.reply_voice(voice=audio_bytes)
-            if not usou_elevenlabs:
-                await update.message.reply_text("(Áudio gerado com qualidade reduzida — voz ElevenLabs temporariamente indisponível)")
-            if len(resposta_texto) > 200:
-                await update.message.reply_text(f"(Texto completo):\n{resposta_texto}")
+        elif voice_id != GOOGLE_VOICE_ID and not usou_elevenlabs:
+            aviso = (
+                "Xiii, hoje eu já falei muito bonito por aqui! "
+                "Minha voz premium deu uma pausa. "
+                "Tente usar a voz do Google no menu de vozes — essa não tem limite."
+            )
+            audio_aviso = await gtts_audio(aviso)
+            if audio_aviso:
+                await update.message.reply_voice(voice=audio_aviso)
+            else:
+                await update.message.reply_text(resposta_texto)
         else:
-            await update.message.reply_text(f"Áudio indisponível agora. Resposta:\n\n{resposta_texto}")
+            await update.message.reply_text(resposta_texto)
 
     except Exception as e:
         logger.error(f"Erro audio: {e}")
@@ -749,103 +738,84 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ─── VOZ ─────────────────────────────────────────────────────────────────────
 
+async def responder_audio(update: Update, texto: str):
+    """Envia texto como áudio. Fallback para texto se gTTS falhar."""
+    audio = await gtts_audio(texto)
+    if audio:
+        await update.message.reply_voice(voice=audio)
+    else:
+        await update.message.reply_text(texto)
+
 async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
-    Usuário manda áudio → transcrevemos → Max responde em áudio com a voz escolhida.
-    - Se a voz for ElevenLabs e o limite diário for atingido,
-      o bot avisa com áudio usando Google TTS (nunca texto de erro).
-    - Se a voz for Google TTS, sem limite.
+    Usuário manda áudio → Max transcreve → gera resposta → responde em áudio.
+    - Google TTS selecionado: voz leve, sem limite.
+    - ElevenLabs selecionado: voz premium. Se limite atingido, avisa em áudio com gTTS.
     """
     chat_id = update.effective_chat.id
     user_id = update.effective_user.id
 
-    # Rate limit de mensagens
-    pode_msg, espera_msg = checar_rate_limit(user_id, tipo="msg")
+    # Rate limit diário de mensagens
+    pode_msg, _ = checar_rate_limit(user_id, tipo="msg")
     if not pode_msg:
-        aviso = "Opa, você já conversou bastante comigo hoje! Dá um tempo e volta depois."
-        audio_aviso = await gtts_audio(aviso)
-        if audio_aviso:
-            await update.message.reply_voice(voice=audio_aviso)
-        else:
-            await update.message.reply_text(aviso)
+        await responder_audio(update, "Ei, você já falou muito comigo hoje! Que tal dar uma pausa e voltar amanhã?")
         return
 
     await context.bot.send_chat_action(chat_id=chat_id, action=ChatAction.TYPING)
 
-    # Baixar e transcrever o áudio enviado pelo usuário
+    # Baixar áudio enviado pelo usuário
     voice_meta = update.message.voice
     voice_file = await context.bot.get_file(voice_meta.file_id)
-
     async with aiohttp.ClientSession() as session:
         async with session.get(voice_file.file_path) as resp:
             audio_bytes_in = await resp.read()
 
+    # Transcrever
     transcricao = await transcrever_audio_gemini(audio_bytes_in, mime_type="audio/ogg")
-
     if not transcricao:
-        aviso = "Não consegui entender o que você falou. Pode repetir?"
-        audio_aviso = await gtts_audio(aviso)
-        if audio_aviso:
-            await update.message.reply_voice(voice=audio_aviso)
-        else:
-            await update.message.reply_text(aviso)
+        await responder_audio(update, "Não entendi o que você falou. Pode repetir?")
         return
 
     logger.info(f"Transcrição: {transcricao}")
 
+    # Histórico de conversa
     if user_id not in user_history:
         user_history[user_id] = []
-
     user_history[user_id].append({"role": "user", "content": transcricao})
     if len(user_history[user_id]) > 30:
         user_history[user_id] = user_history[user_id][-30:]
 
+    # Gerar resposta da IA
     try:
         resposta = await perguntar_ia(user_history[user_id])
-        user_history[user_id].append({"role": "assistant", "content": resposta})
-
-        await context.bot.send_chat_action(chat_id=chat_id, action=ChatAction.RECORD_VOICE)
-
-        voice_id = get_voice_id(user_id)
-
-        # Se é ElevenLabs, checar limite diário de áudio gerado
-        if voice_id != GOOGLE_VOICE_ID:
-            pode_el, _ = checar_limite_audio(user_id, len(resposta) / 15)  # estimativa de duração
-            if not pode_el:
-                aviso = (
-                    "Opa! Hoje já usei bastante o ElevenLabs por aqui. "
-                    "Você pode escolher a voz do Google no menu, que não tem limite. "
-                    "Amanhã a gente volta ao normal!"
-                )
-                audio_aviso = await gtts_audio(aviso)
-                if audio_aviso:
-                    await update.message.reply_voice(voice=audio_aviso)
-                else:
-                    await update.message.reply_text(aviso)
-                return
-
-        audio_resposta, usou_elevenlabs = await texto_para_audio(resposta, voice_id=voice_id)
-
-        if audio_resposta:
-            await update.message.reply_voice(voice=audio_resposta)
-            # Se caiu no fallback Google sem querer (ElevenLabs caiu), avisa em áudio
-            if voice_id != GOOGLE_VOICE_ID and not usou_elevenlabs:
-                fallback_aviso = "Minha voz premium tá com problema agora, usei o Google. Tenta de novo em breve!"
-                audio_fb = await gtts_audio(fallback_aviso)
-                if audio_fb:
-                    await update.message.reply_voice(voice=audio_fb)
-        else:
-            # Se nem áudio nem fallback funcionaram, aí manda texto
-            await update.message.reply_text(resposta)
-
     except Exception as e:
-        logger.error(f"Erro no handle_voice: {e}")
-        aviso = "Deu um problema aqui do meu lado. Pode tentar de novo?"
-        audio_err = await gtts_audio(aviso)
-        if audio_err:
-            await update.message.reply_voice(voice=audio_err)
-        else:
-            await update.message.reply_text(aviso)
+        logger.error(f"Erro IA no handle_voice: {e}")
+        await responder_audio(update, "Deu um problema aqui do meu lado. Pode tentar de novo?")
+        return
+
+    user_history[user_id].append({"role": "assistant", "content": resposta})
+    await context.bot.send_chat_action(chat_id=chat_id, action=ChatAction.RECORD_VOICE)
+
+    voice_id = get_voice_id(user_id)
+
+    # Gerar áudio da resposta
+    audio_resposta, usou_elevenlabs = await texto_para_audio(resposta, user_id=user_id, voice_id=voice_id)
+
+    if audio_resposta:
+        await update.message.reply_voice(voice=audio_resposta)
+    elif voice_id != GOOGLE_VOICE_ID and not usou_elevenlabs:
+        # Limite ElevenLabs atingido — avisa com personalidade, em voz gTTS
+        aviso = (
+            "Xiii, hoje eu já falei muito bonito por aqui! "
+            "Minha voz premium deu uma pausa. "
+            "Você pode me pedir pra usar a voz do Google no menu de vozes — "
+            "essa não tem limite e tô disponível o tempo todo. "
+            "Amanhã minha voz favorita volta!"
+        )
+        await responder_audio(update, aviso)
+    else:
+        # Erro total de áudio — manda texto como último recurso
+        await update.message.reply_text(resposta)
 
 # ─── MAIN ────────────────────────────────────────────────────────────────────
 
