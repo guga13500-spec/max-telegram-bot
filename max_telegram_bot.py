@@ -1,4 +1,4 @@
-# rebuild: 20260505005337
+# rebuild: 20260505021500
 import os
 import io
 import logging
@@ -25,7 +25,7 @@ ELEVENLABS_MODEL = "eleven_multilingual_v2"
 
 BR_TIMEZONE = pytz.timezone("America/Sao_Paulo")
 DATA_CRIACAO = "01 de maio de 2025"
-BUILD_VERSION = "v3.2-fix-voice"
+BUILD_VERSION = "v3.3-cache-bust"
 
 # ─── RATE LIMIT ──────────────────────────────────────────────────────────────
 
@@ -822,6 +822,10 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Gerar resposta da IA
     try:
         resposta = await perguntar_ia(user_history[user_id])
+    except NameError as e:
+        logger.error(f"NameError crítico em handle_voice: {e} — versão desatualizada em cache?")
+        await update.message.reply_text("Reiniciando... tenta de novo em 5 segundos.")
+        return
     except Exception as e:
         logger.error(f"Erro IA no handle_voice: {e}")
         await responder_audio(update, "Deu um problema aqui do meu lado. Pode tentar de novo?")
