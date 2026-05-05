@@ -24,6 +24,7 @@ ELEVENLABS_MODEL = "eleven_multilingual_v2"
 
 BR_TIMEZONE = pytz.timezone("America/Sao_Paulo")
 DATA_CRIACAO = "01 de maio de 2025"
+BUILD_VERSION = "v3.2-fix-voice"
 
 # ─── RATE LIMIT ──────────────────────────────────────────────────────────────
 
